@@ -197,6 +197,30 @@ void pybind_pointcloud_definitions(py::module& m) {
                        return self.Append(other);
                    });
 
+    pointcloud.def("normalize_gaussian_splat_clipping",
+                   &PointCloud::NormalizeGaussianSplatClipping,
+                   R"doc(Return a shallow CPU copy with canonical Gaussian clipping attributes.
+
+The four Float32 (N,1) attributes ``clip1_angle``, ``clip1_split``,
+``clip2_angle``, ``clip2_split`` keep cos(angle)*u+sin(angle)*v >= split
+in Gaussian-scale-normalized local coordinates. Angles use radians in
+[-pi,pi), or 4.0 to disable a boundary. Inactive splits become zero.
+The Gaussian's position, scale, rotation, opacity and color remain shared.
+
+All four attributes must be supplied together; omitting all means ordinary
+2DGS. Obsolete half_opacity, half_split, clip_planes, clip_lines, clip_count
+and keep_side attributes raise ValueError without conversion. Remove them and
+regenerate the four canonical attributes. A second-only boundary is invalid.
+No automatic device transfer is performed.
+
+Example::
+
+    pcd.point.clip1_angle = o3d.core.Tensor([[0.0]], o3d.core.float32)
+    pcd.point.clip1_split = o3d.core.Tensor([[0.0]], o3d.core.float32)
+    pcd.point.clip2_angle = o3d.core.Tensor([[1.5707963]], o3d.core.float32)
+    pcd.point.clip2_split = o3d.core.Tensor([[0.0]], o3d.core.float32)
+    canonical = pcd.normalize_gaussian_splat_clipping()
+)doc");
     pointcloud.def("transform", &PointCloud::Transform, "transformation"_a,
                    "Transforms the points and normals (if exist).");
     pointcloud.def("translate", &PointCloud::Translate, "translation"_a,

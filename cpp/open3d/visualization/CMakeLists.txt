@@ -94,6 +94,7 @@ if (BUILD_GUI)
         rendering/gaussian_splat/GaussianSplatRenderer.cpp
         rendering/gaussian_splat/GaussianSplatDataPacking.cpp
         rendering/gaussian_splat/GaussianSplatPassRunner.cpp
+        rendering/gaussian_splat/GaussianSplatRayQuery.cpp
         rendering/filament/FilamentEntitiesMods.cpp
         rendering/filament/FilamentGeometryBuffersBuilder.cpp
         rendering/filament/FilamentRenderToBuffer.cpp

@@ -37,6 +37,8 @@ layout(std140, binding = 0) uniform GaussianViewParams {
     uvec4 limits;
     // depth_range_and_flags: x=near, y=far, z=reserved, w=reserved
     vec4 depth_range_and_flags;
+    // One Phong triple for every GS; w is reserved and zero.
+    vec4 surface_lighting;
 }
 view_params;
 

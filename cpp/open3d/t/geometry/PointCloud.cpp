@@ -17,6 +17,7 @@
 #include <Eigen/Geometry>
 #include <algorithm>
 #include <limits>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -32,6 +33,7 @@
 #include "open3d/core/linalg/Matmul.h"
 #include "open3d/core/nns/NearestNeighborSearch.h"
 #include "open3d/t/geometry/TensorMap.h"
+#include "open3d/t/geometry/GaussianSplatClipping.h"
 #include "open3d/t/geometry/TriangleMesh.h"
 #include "open3d/t/geometry/VtkUtils.h"
 #include "open3d/t/geometry/kernel/GeometryMacros.h"
@@ -48,110 +50,8 @@ namespace geometry {
 
 namespace {
 
-// ---------------------------------------------------------------------------
-// Ivanic–Ruedenberg real-SH rotation helpers.
-// Ivanic and K. Ruedenberg, "Rotation Matrices for Real Spherical Harmonics.
-// Direct Determination by Recursion", J. Phys. Chem., vol. 100, no. 15, pp.
-// 6342-6347, 1996. http://pubs.acs.org/doi/pdf/10.1021/jp953350u
-// Corrections (1998): http://pubs.acs.org/doi/pdf/10.1021/jp9833350
-// Conventions: No Condon-Shortley phase, same as GraphDECO 3DGS.
-//
-// BuildIrR1   : degree-1 IR matrix — maps (y,z,x) SH ordering to the
-//               shader's EvaluateShDegree1 convention (m=-1→y, m=0→z, m=+1→x).
-// BuildIrRl   : degree l≥2 matrix via u,v,w recursion (Ivanic 1996 eq.).
-// RotateGSSplat: updates rot + f_rest for a GS PointCloud after Rotate().
-// ---------------------------------------------------------------------------
-
-Eigen::Matrix3f BuildIrR1(const Eigen::Matrix3f& R) {
-    // SH degree-1 basis index → Cartesian axis: {y=1, z=2, x=0}
-    constexpr int idx[3] = {1, 2, 0};
-    Eigen::Matrix3f R1;
-    for (int i = 0; i < 3; ++i)
-        for (int j = 0; j < 3; ++j) R1(i, j) = R(idx[i], idx[j]);
-    return R1;
-}
-
-Eigen::MatrixXf BuildIrRl(int l,
-                          const Eigen::Matrix3f& R1,
-                          const Eigen::MatrixXf& Rp) {
-    // Rp: IR matrix for degree l-1 (shape (2(l-1)+1) × (2(l-1)+1)).
-    // Ivanic–Ruedenberg (1996) + 1998 erratum.
-    // P(i, a, b) accesses Rp with row index a ∈ [-(l-1), l-1].
-    auto P = [&](int i, int a, int b) -> float {
-        // g(m, n) indexes Rp with offset so m ∈ [-(l-1), l-1] maps to [0, 2l-2]
-        auto g = [&](int m, int n) -> float {
-            return Rp(m + l - 1, n + l - 1);
-        };
-        if (b == l)
-            return R1(i + 1, 2) * g(a, l - 1) - R1(i + 1, 0) * g(a, -(l - 1));
-        if (b == -l)
-            return R1(i + 1, 2) * g(a, -(l - 1)) + R1(i + 1, 0) * g(a, l - 1);
-        return R1(i + 1, 1) * g(a, b);
-    };
-
-    int s = 2 * l + 1;
-    Eigen::MatrixXf Rl = Eigen::MatrixXf::Zero(s, s);
-    for (int m = -l; m <= l; ++m) {
-        for (int n = -l; n <= l; ++n) {
-            float d = (m == 0) ? 1.f : 0.f;
-            float denom = std::abs(n) < l ? float(l * l - n * n)
-                                          : float(l * (2 * l - 1));
-            float am = std::abs(float(m));
-
-            // u weight (zero when |m| == l, so P(0, m, n) is never
-            // out-of-bounds).
-            float u = std::sqrt(float(l * l - m * m) / denom);
-
-            // v weight — incorporates sqrt(1+delta_{m,1}) / sqrt(2) factors.
-            float v = 0.5f *
-                      std::sqrt((1.f + d) * (l + am - 1.f) * (l + am) / denom) *
-                      (1.f - 2.f * d);
-
-            // w weight (zero when m == 0).
-            float w = am > 0.f ? -0.5f * std::sqrt((l - am - 1.f) * (l - am) /
-                                                   denom)
-                               : 0.f;
-
-            float res = 0.f;
-
-            // U term: row index = m (safe because u == 0 when |m| == l).
-            if (u != 0.f) res += u * P(0, m, n);
-
-            // V term (Table 2 of Ivanic & Ruedenberg 1998 erratum).
-            if (v != 0.f) {
-                if (m == 0) {
-                    res += v * (P(1, 1, n) + P(-1, -1, n));
-                } else if (m > 0) {
-                    float dv = (m == 1) ? 1.f : 0.f;
-                    res += v * (P(1, m - 1, n) * std::sqrt(1.f + dv) -
-                                P(-1, -m + 1, n) * (1.f - dv));
-                } else {
-                    // m < 0
-                    float dv = (m == -1) ? 1.f : 0.f;
-                    res += v * (P(1, m + 1, n) * (1.f - dv) +
-                                P(-1, -m - 1, n) * std::sqrt(1.f + dv));
-                }
-            }
-
-            // W term: uses shifted row indices (w == 0 when m == 0).
-            if (w != 0.f) {
-                if (m > 0) {
-                    res += w * (P(1, m + 1, n) + P(-1, -m - 1, n));
-                } else {
-                    // m < 0 (m == 0 excluded by w == 0)
-                    res += w * (P(1, m - 1, n) - P(-1, -m + 1, n));
-                }
-            }
-
-            Rl(m + l, n + l) = res;
-        }
-    }
-    return Rl;
-}
-
-// Update rot and f_rest in-place after Rotate(R, center).
-// Proper rotation is assumed (same policy as RotateNormalsKernel).
-// rot: CPU Eigen loop. f_rest: IR matrices computed on CPU, Matmul on device.
+// Rotate the Gaussian frame; shared RGB is invariant.
+// Proper rotation follows the existing RotateNormalsKernel convention.
 void RotateGSSplat(const core::Tensor& R_tensor, PointCloud& pcd) {
     auto device = pcd.GetDevice();
     int64_t N = pcd.GetPointPositions().GetLength();
@@ -183,46 +83,7 @@ void RotateGSSplat(const core::Tensor& R_tensor, PointCloud& pcd) {
         pcd.SetPointAttr("rot", rot_attr.To(device));
     }
 
-    // --- SH rotation (all devices via Tensor Matmul) ---
-    // f_dc (degree-0) is invariant; f_rest holds degrees 1 … sh_degree.
-    int sh_degree = pcd.GaussianSplatGetSHOrder();
-    if (sh_degree == 0) return;
 
-    auto& f_rest_attr = pcd.GetPointAttr("f_rest");
-    int64_t Nc = f_rest_attr.GetShape(1);  // (sh_degree+1)² − 1
-
-    // Build block-diagonal rotation matrix R_full (Nc×Nc) on CPU, then
-    // transpose it — we need R_full^T for the right-multiply: f @ R_full^T.
-    Eigen::MatrixXf R_full_T = Eigen::MatrixXf::Zero(Nc, Nc);
-    Eigen::Matrix3f R1 = BuildIrR1(R);
-    Eigen::MatrixXf Rp = R1;
-    int offset = 0;
-    for (int l = 1; l <= sh_degree; ++l) {
-        int sl = 2 * l + 1;
-        Eigen::MatrixXf Rl =
-                (l == 1) ? Eigen::MatrixXf(R1) : BuildIrRl(l, R1, Rp);
-        R_full_T.block(offset, offset, sl, sl) = Rl.transpose();
-        Rp = Rl;
-        offset += sl;
-    }
-
-    // Pack into a float32 Tensor and move to device.
-    std::vector<float> rft_data(Nc * Nc);
-    for (int r = 0; r < Nc; ++r)
-        for (int c = 0; c < Nc; ++c) rft_data[r * Nc + c] = R_full_T(r, c);
-    core::Tensor Rft(rft_data, {Nc, Nc}, core::Float32, core::Device("CPU:0"));
-    Rft = Rft.To(device, core::Float32);
-
-    // f_rest {N, Nc, 3} → permute {N, 3, Nc} → reshape {N*3, Nc}
-    //   @ Rft {Nc, Nc}  → {N*3, Nc} → reshape {N, 3, Nc} → permute {N, Nc, 3}
-    auto f_2d = f_rest_attr.To(core::Float32)
-                        .Permute({0, 2, 1})
-                        .Contiguous()
-                        .Reshape({N * 3, Nc});
-    f_rest_attr = f_2d.Matmul(Rft)
-                          .Reshape({N, 3, Nc})
-                          .Permute({0, 2, 1})
-                          .Contiguous();
 }
 
 }  // namespace
@@ -351,6 +212,7 @@ PointCloud PointCloud::Append(const PointCloud& other) const {
 
 PointCloud& PointCloud::Transform(const core::Tensor& transformation) {
     core::AssertTensorShape(transformation, {4, 4});
+    const bool is_gaussian_splat = IsGaussianSplat();
 
     kernel::transform::TransformPoints(transformation, GetPointPositions());
     if (HasPointNormals()) {
@@ -358,12 +220,12 @@ PointCloud& PointCloud::Transform(const core::Tensor& transformation) {
     }
 
     // The linear part of a general 4×4 may be non-orthogonal, so covariance
-    // (rot, scale) and SH (f_rest) cannot be updated generically.
+    // (rot, scale) cannot be updated generically.
     // Compose Rotate() + Scale() + Translate() instead for GS clouds.
-    if (IsGaussianSplat()) {
+    if (is_gaussian_splat) {
         utility::LogWarning(
                 "PointCloud::Transform() does not update Gaussian splat "
-                "attributes (rot, scale, f_rest). Use Rotate(), Scale(), and "
+                "attributes (rot, scale). Use Rotate(), Scale(), and "
                 "Translate() instead.");
     }
 
@@ -386,27 +248,16 @@ PointCloud& PointCloud::Translate(const core::Tensor& translation,
 
 PointCloud& PointCloud::Scale(double scale, const core::Tensor& center) {
     core::AssertTensorShape(center, {3});
+    const bool is_gaussian_splat = IsGaussianSplat();
 
     const core::Tensor center_d =
             center.To(GetDevice(), GetPointPositions().GetDtype());
     GetPointPositions().Sub_(center_d).Mul_(scale).Add_(center_d);
 
-    // For GS splats, negative uniform scale means point inversion plus
-    // positive scaling: positions are mirrored (above), axis lengths scale by
-    // |scale|, and odd-degree SH bands flip sign because Y_lm(-d) = (-1)^l
-    // Y_lm(d).
-    if (IsGaussianSplat()) {
+    // Negative uniform scaling inverts positions and scales the tangent
+    // sigma by its magnitude. Shared color remains unchanged.
+    if (is_gaussian_splat) {
         GetPointAttr("scale").Mul_(std::abs(scale));
-        if (scale < 0.0) {
-            int sh_degree = GaussianSplatGetSHOrder();
-            for (int l = 1; l <= sh_degree; l += 2) {
-                const int offset = l * l - 1;
-                const int size_l = 2 * l + 1;
-                GetPointAttr("f_rest")
-                        .Slice(1, offset, offset + size_l)
-                        .Mul_(-1.0);
-            }
-        }
     }
 
     return *this;
@@ -416,16 +267,17 @@ PointCloud& PointCloud::Rotate(const core::Tensor& R,
                                const core::Tensor& center) {
     core::AssertTensorShape(R, {3, 3});
     core::AssertTensorShape(center, {3});
+    const bool is_gaussian_splat = IsGaussianSplat();
 
     kernel::transform::RotatePoints(R, GetPointPositions(), center);
     if (HasPointNormals()) {
         kernel::transform::RotateNormals(R, GetPointNormals());
     }
 
-    // For GS splats: rotate quaternions (CPU) and SH coefficients (all
-    // devices). Proper rotation is assumed, consistent with RotateNormalsKernel
+    // For GS splats: rotate quaternions. Proper rotation is assumed,
+    // consistent with RotateNormalsKernel
     // which applies R directly without orthogonality checks.
-    if (IsGaussianSplat()) {
+    if (is_gaussian_splat) {
         RotateGSSplat(R, *this);
     }
 
@@ -1836,38 +1688,174 @@ core::Tensor PointCloud::ComputeMetrics(const PointCloud& pcd2,
 }
 
 bool PointCloud::IsGaussianSplat() const {
-    bool have_all_attrs = HasPointAttr("opacity") && HasPointAttr("rot") &&
-                          HasPointAttr("scale") && HasPointAttr("f_dc");
-    if (!have_all_attrs) {  // not 3DGS, no messages.
+    // Reject removed SH names even when the new signature is incomplete;
+    // otherwise old Gaussian clouds could silently become ordinary points.
+    for (const char* name : {"f_dc", "f_rest"}) {
+        if (point_attr_.Contains(name)) {
+            throw std::invalid_argument(
+                    std::string(name) + " is no longer supported. Use "
+                    "surface_color and MaterialRecord.gaussian_splat_surface_lighting "
+                    "for Phong shading.");
+        }
+    }
+    if (point_attr_.Contains("surface_lighting")) {
+        throw std::invalid_argument(
+                "Per-GS surface_lighting is no longer supported. Use "
+                "MaterialRecord.gaussian_splat_surface_lighting instead.");
+    }
+    // Ordinary point clouds may still carry unrelated custom attributes.
+    // Once the Gaussian shape is present, appearance must be complete.
+    if (!point_attr_.Contains("rot") || !point_attr_.Contains("scale")) {
         return false;
     }
-    // Existing but invalid attributes cause errors.
-    auto num_points = GetPointPositions().GetLength();
-    core::AssertTensorShape(GetPointAttr("opacity"), {num_points, 1});
+    if (point_attr_.Contains("opacity")) {
+        throw std::invalid_argument(
+                "Gaussian splat opacity is no longer supported. Remove the "
+                "opacity attribute; all Gaussian splats use fixed opacity "
+                "0.99.");
+    }
+    const auto num_points = GetPointPositions().GetLength();
     core::AssertTensorShape(GetPointAttr("rot"), {num_points, 4});
-    core::AssertTensorShape(GetPointAttr("scale"), {num_points, 3});
-    core::AssertTensorShape(GetPointAttr("f_dc"), {num_points, 3});
-    GaussianSplatGetSHOrder();  // Tests f_rest shape is valid.
+    if (GetPointAttr("scale").GetShape() != core::SizeVector{num_points, 1}) {
+        throw std::invalid_argument(
+                "Gaussian splat scale must have shape (N, 1), containing one "
+                "isotropic tangent scale per GS (X = Y). scale.z is no longer "
+                "supported; (N, 2) and (N, 3) scales are not accepted.");
+    }
+    if (!point_attr_.Contains("surface_color")) {
+        throw std::invalid_argument("Gaussian splats require surface_color.");
+    }
+    const auto& color = GetPointAttr("surface_color");
+    if (color.GetDtype() != core::Float32 ||
+        color.GetShape() != core::SizeVector{num_points, 3}) {
+        throw std::invalid_argument(
+                "Gaussian surface_color must be Float32 with shape (N, 3).");
+    }
+    // Reductions stay on the tensor device; only scalar results are read.
+    // Empty clouds retain the strict shape/type contract without reduction.
+    if (num_points > 0 &&
+        (!color.IsFinite().All().Item<bool>() ||
+         !color.Ge(0).All().Item<bool>() || !color.Le(1).All().Item<bool>())) {
+        throw std::invalid_argument(
+                "Gaussian surface_color must contain finite RGB values in [0, 1].");
+    }
+    if (point_attr_.Contains("surface_id")) {
+        const auto& ids = GetPointAttr("surface_id");
+        if (ids.GetDtype() != core::Int32 ||
+            ids.GetShape() != core::SizeVector{num_points, 1} ||
+            (num_points > 0 && !ids.Ge(0).All().Item<bool>())) {
+            throw std::invalid_argument(
+                    "Gaussian surface_id must be nonnegative Int32 with shape (N, 1).");
+        }
+    }
+
     return true;
 }
 
-int PointCloud::GaussianSplatGetSHOrder() const {
-    if (point_attr_.find("f_rest") == point_attr_.end()) {
-        return 0;
+namespace {
+constexpr const char* kGaussianClipAttributeNames[] = {
+        "clip1_angle", "clip1_split", "clip2_angle", "clip2_split"};
+
+// Share strict attribute checks between scene registration/update and explicit
+// normalization. A null output validates without allocating per-point records.
+void ReadGaussianSplatClipData(const PointCloud& cloud,
+                              std::vector<GaussianSplatClipData>* output) {
+    const auto& attributes = cloud.GetPointAttr();
+    for (const char* name : {"half_split", "half_opacity", "clip_planes",
+                             "clip_lines", "clip_count", "keep_side"}) {
+        if (attributes.Contains(name)) {
+            const char* replacement =
+                    std::string(name) == "half_split"
+                            ? "clip1_angle and clip1_split"
+                            : "clip1_angle, clip1_split, clip2_angle and "
+                              "clip2_split";
+            throw std::invalid_argument(
+                    std::string(name) + " is no longer supported. Use " +
+                    replacement + " instead.");
+        }
     }
-    const core::Tensor& f_rest = GetPointAttr("f_rest");
-    auto num_points = GetPointPositions().GetLength();
-    core::AssertTensorShape(f_rest, {num_points, core::None, 3});
-    auto Nc = f_rest.GetShape(1);
-    auto degp1 = static_cast<int>(sqrt(Nc + 1));
-    if (degp1 * degp1 != Nc + 1) {
-        utility::LogError(
-                "f_rest has incomplete Spherical Harmonics coefficients "
-                "({}), expected 0, 3, 8 or 15.",
-                Nc);
+    int present = 0;
+    for (const char* name : kGaussianClipAttributeNames) {
+        present += attributes.Contains(name);
     }
-    return degp1 - 1;
+    if (present != 0 && present != 4) {
+        throw std::invalid_argument(
+                "Gaussian clipping requires all four attributes: clip1_angle, "
+                "clip1_split, clip2_angle and clip2_split; omit all four for "
+                "ordinary 2DGS.");
+    }
+    // A default empty point cloud need not contain a positions tensor.
+    if (!present && !output) return;
+    const int64_t n = cloud.GetPointPositions().GetLength();
+    if (output) {
+        output->clear();
+        output->reserve(static_cast<size_t>(n));
+    }
+    if (!present) {
+        if (output) output->resize(static_cast<size_t>(n));
+        return;
+    }
+    core::Tensor inputs[4];
+    for (int j = 0; j < 4; ++j) {
+        const auto& tensor = cloud.GetPointAttr(kGaussianClipAttributeNames[j]);
+        core::AssertTensorShape(tensor, {n, 1});
+        if (!tensor.GetDevice().IsCPU()) {
+            utility::LogError(
+                    "Gaussian clipping attributes must be on CPU; transfer "
+                    "the point cloud explicitly.");
+        }
+        inputs[j] = tensor.To(core::Float32).Contiguous();
+    }
+    for (int64_t i = 0; i < n; ++i) {
+        const auto clip = NormalizeGaussianClipData(
+                {inputs[0].GetDataPtr<float>()[i],
+                 inputs[1].GetDataPtr<float>()[i],
+                 inputs[2].GetDataPtr<float>()[i],
+                 inputs[3].GetDataPtr<float>()[i]});
+        if (output) output->push_back(clip);
+    }
 }
+}  // namespace
+
+void PointCloud::ValidateGaussianSplatClipping() const {
+    ReadGaussianSplatClipData(*this, nullptr);
+}
+
+PointCloud PointCloud::NormalizeGaussianSplatClipping() const {
+    std::vector<GaussianSplatClipData> clips;
+    ReadGaussianSplatClipData(*this, &clips);
+    if (!GetDevice().IsCPU()) {
+        utility::LogError(
+                "Gaussian clipping normalization requires a CPU point cloud; "
+                "transfer it explicitly.");
+    }
+    if (!IsGaussianSplat()) {
+        utility::LogError(
+                "Gaussian clipping normalization requires Gaussian splat "
+                "attributes.");
+    }
+
+    // Only the four scalar clip arrays allocate new tensor storage. Position,
+    // shape and color remain shared and unchanged on the result.
+    const int64_t n = GetPointPositions().GetLength();
+    PointCloud result(*this);
+    core::Tensor output[4];
+    for (int j = 0; j < 4; ++j) {
+        output[j] = core::Tensor::Empty({n, 1}, core::Float32);
+    }
+    for (int64_t i = 0; i < n; ++i) {
+        const auto& clip = clips[static_cast<size_t>(i)];
+        output[0].GetDataPtr<float>()[i] = clip.clip1_angle;
+        output[1].GetDataPtr<float>()[i] = clip.clip1_split;
+        output[2].GetDataPtr<float>()[i] = clip.clip2_angle;
+        output[3].GetDataPtr<float>()[i] = clip.clip2_split;
+    }
+    for (int j = 0; j < 4; ++j) {
+        result.SetPointAttr(kGaussianClipAttributeNames[j], output[j]);
+    }
+    return result;
+}
+
 }  // namespace geometry
 }  // namespace t
 }  // namespace open3d

@@ -46,7 +46,9 @@ enum class ComputeProgramId : int {
     /// Merges GS linear depth (R32F) with Filament scene depth (reversed-Z)
     /// into a normalised R16UI texture for CPU readback.
     kGsDepthMerge = 5,
-    kCount = 6,
+    /// All-candidate finite-surface queries sharing composite ray math.
+    kGsDexel = 6,
+    kCount = 7,
 };
 
 /// Format selector for GaussianSplatGpuContext::BindImage().
@@ -61,6 +63,7 @@ constexpr const char* kGsShaderNames[] = {
         "gaussian_radix_sort_scatter",
         "gaussian_compute_dispatch_args",
         "gaussian_depth_merge",
+        "gaussian_dexel",
 };
 static_assert(std::size(kGsShaderNames) ==
                       static_cast<std::size_t>(ComputeProgramId::kCount),
@@ -87,10 +90,8 @@ static_assert(sizeof(RadixSortParams) == 16,
 struct GaussianSplatViewGpuResources {
     std::uintptr_t view_params_buf = 0;
     std::uintptr_t positions_buf = 0;
-    std::uintptr_t scales_buf = 0;
     std::uintptr_t rotations_buf = 0;
-    std::uintptr_t dc_opacity_buf = 0;
-    std::uintptr_t sh_buf = 0;
+    std::uintptr_t surface_data_buf = 0;
     /// Composite-pass projected data (32 B/splat, binding 6).
     /// Written by project, read only by composite.
     std::uintptr_t projected_composite_buf = 0;
@@ -145,6 +146,19 @@ public:
                                         std::size_t new_size,
                                         const char* label = nullptr) = 0;
 
+    /// GPU-written output that will be read on the CPU. Vulkan prefers
+    /// host-cached mapped memory; unified-memory backends can reuse ordinary
+    /// buffers. Upload buffers keep their existing allocation policy.
+    virtual std::uintptr_t CreateReadbackBuffer(std::size_t size,
+                                               const char* label = nullptr) {
+        return CreateBuffer(size, label);
+    }
+    virtual std::uintptr_t ResizeReadbackBuffer(std::uintptr_t buf,
+                                               std::size_t new_size,
+                                               const char* label = nullptr) {
+        return ResizeBuffer(buf, new_size, label);
+    }
+
     /// GPU-private buffer: never CPU-mapped after creation.
     /// Metal uses MTLStorageModePrivate; Vulkan uses device-local memory.
     virtual std::uintptr_t CreatePrivateBuffer(std::size_t size,
@@ -188,6 +202,9 @@ public:
     virtual void DispatchIndirect(std::uintptr_t indirect_buf,
                                   std::size_t byte_offset) = 0;
     virtual void FullBarrier() = 0;
+    /// Make submitted GPU writes available for host reads after a fence wait.
+    /// Non-coherent mappings must still be invalidated before the CPU copies.
+    virtual void ReadbackBarrier() { FullBarrier(); }
 
     /// Maximum compute dispatch group count along the X axis.
     /// Used to split large dispatches into 2D grids that stay within device

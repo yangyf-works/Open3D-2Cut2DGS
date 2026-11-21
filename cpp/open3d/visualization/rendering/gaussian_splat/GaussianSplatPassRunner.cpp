@@ -170,10 +170,8 @@ void DestroyGaussianSplatViewGpuResources(
     };
     destroy_buffer(resources.view_params_buf);
     destroy_buffer(resources.positions_buf);
-    destroy_buffer(resources.scales_buf);
     destroy_buffer(resources.rotations_buf);
-    destroy_buffer(resources.dc_opacity_buf);
-    destroy_buffer(resources.sh_buf);
+    destroy_buffer(resources.surface_data_buf);
     destroy_buffer(resources.projected_composite_buf);
     destroy_buffer(resources.tile_counts_buf);
     destroy_buffer(resources.counters_buf);
@@ -233,9 +231,6 @@ bool RunGaussianGeometryPasses(
         vs.positions_buf = ctx.ResizeBuffer(
                 vs.positions_buf, attrs.positions.size() * sizeof(Std430Vec4),
                 "gs.positions");
-        vs.scales_buf = ctx.ResizeBuffer(
-                vs.scales_buf, attrs.scales.size() * sizeof(std::uint32_t),
-                "gs.scales");
         assert(attrs.visibility_mask.size() == mask_words &&
                "visibility_mask must be bit-packed: ceil(splat_count/32) "
                "words");
@@ -243,21 +238,11 @@ bool RunGaussianGeometryPasses(
                 vs.mask_buf, mask_words * sizeof(std::uint32_t), "gs.mask");
         vs.rotations_buf = ctx.ResizeBuffer(
                 vs.rotations_buf,
-                attrs.rotations.size() * sizeof(std::uint32_t), "gs.rotations");
-        vs.dc_opacity_buf = ctx.ResizeBuffer(
-                vs.dc_opacity_buf,
-                attrs.dc_opacity.size() * sizeof(std::uint32_t),
-                "gs.dc_opacity");
-        // Always keep this buffer non-empty: the project shader statically
-        // references binding 5 even when guarded by "if (sh_degree >= 1u)",
-        // so a size-0 (i.e. unallocated) buffer leaves the descriptor unwritten
-        // and unbound, which some drivers (e.g. Intel Arc) fault on even
-        // though it's never read at that degree
-        // (VUID-vkCmdDispatch-None-08114).
-        const std::size_t sh_bytes =
-                std::max<std::size_t>(1, attrs.sh_coefficients.size()) *
-                sizeof(std::uint32_t);
-        vs.sh_buf = ctx.ResizeBuffer(vs.sh_buf, sh_bytes, "gs.sh_coeffs");
+                attrs.rotations.size() * sizeof(attrs.rotations[0]), "gs.rotations");
+        vs.surface_data_buf = ctx.ResizeBuffer(
+                vs.surface_data_buf,
+                attrs.surface_data.size() * sizeof(std::uint32_t),
+                "gs.surface_data");
     }
 
     // GPU-only intermediate buffers: private storage for better cache
@@ -298,20 +283,15 @@ bool RunGaussianGeometryPasses(
     if (scene_changed) {
         ctx.UploadBuffer(vs.positions_buf, attrs.positions.data(),
                          attrs.positions.size() * sizeof(Std430Vec4), 0);
-        ctx.UploadBuffer(vs.scales_buf, attrs.scales.data(),
-                         attrs.scales.size() * sizeof(std::uint32_t), 0);
         if (!attrs.visibility_mask.empty()) {
             ctx.UploadBuffer(
                     vs.mask_buf, attrs.visibility_mask.data(),
                     attrs.visibility_mask.size() * sizeof(std::uint32_t), 0);
         }
         ctx.UploadBuffer(vs.rotations_buf, attrs.rotations.data(),
-                         attrs.rotations.size() * sizeof(std::uint32_t), 0);
-        ctx.UploadBuffer(vs.dc_opacity_buf, attrs.dc_opacity.data(),
-                         attrs.dc_opacity.size() * sizeof(std::uint32_t), 0);
-        ctx.UploadBuffer(vs.sh_buf, attrs.sh_coefficients.data(),
-                         attrs.sh_coefficients.size() * sizeof(std::uint32_t),
-                         0);
+                         attrs.rotations.size() * sizeof(attrs.rotations[0]), 0);
+        ctx.UploadBuffer(vs.surface_data_buf, attrs.surface_data.data(),
+                         attrs.surface_data.size() * sizeof(std::uint32_t), 0);
         vs.cached_scene_id = scene_change_id;
         vs.cached_splat_count = attrs.splat_count;
     }
@@ -336,10 +316,8 @@ bool RunGaussianGeometryPasses(
     GpuComputePass(ctx, ComputeProgramId::kGsProject, "gs_project")
             .UBO(0, vs.view_params_buf)
             .SSBO(1, vs.positions_buf)
-            .SSBO(2, vs.scales_buf)
             .SSBO(3, vs.rotations_buf)
-            .SSBO(4, vs.dc_opacity_buf)
-            .SSBO(5, vs.sh_buf)
+            .SSBO(4, vs.surface_data_buf)
             .SSBO(6, vs.projected_composite_buf)
             .SSBO(7, vs.sort_keys_buf[0])
             .SSBO(8, vs.sort_values_buf[0])

@@ -175,8 +175,13 @@ bool WritePointCloud(const std::string &filename,
 bool ReadPointCloudFromNPZ(const std::string &filename,
                            geometry::PointCloud &pointcloud,
                            const ReadPointCloudOption &params) {
-    // Required checks are performed in the pointcloud constructor itself.
+    // Generic attributes are checked by the constructor; IsGaussianSplat
+    // additionally validates shared RGB and rejects per-GS lighting, removed SH,
+    // multi-axis scales and per-GS opacity.
     pointcloud = geometry::PointCloud(ReadNpz(filename));
+    if (pointcloud.IsGaussianSplat()) {
+        pointcloud = pointcloud.NormalizeGaussianSplatClipping();
+    }
     return true;
 }
 
@@ -192,9 +197,14 @@ bool WritePointCloudToNPZ(const std::string &filename,
                 "PointCloud can't be saved in compressed format as .npz.");
     }
 
-    WriteNpz(filename, pointcloud.GetPointAttr());
+    // Canonicalize a copy so new files contain only four Float32 clip scalars.
+    // Ordinary point clouds retain the existing generic NPZ behavior.
+    const auto canonical = pointcloud.IsGaussianSplat()
+                                   ? pointcloud.NormalizeGaussianSplatClipping()
+                                   : pointcloud;
+    WriteNpz(filename, canonical.GetPointAttr());
     utility::LogDebug("Saved pointcloud has the following attributes:");
-    for (auto &kv : pointcloud.GetPointAttr()) {
+    for (auto &kv : canonical.GetPointAttr()) {
         utility::LogDebug(" {} [shape: {}, stride: {}, {}]", kv.first,
                           kv.second.GetShape().ToString(),
                           kv.second.GetStrides().ToString(),

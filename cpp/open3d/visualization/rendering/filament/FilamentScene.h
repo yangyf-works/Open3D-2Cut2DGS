@@ -382,6 +382,9 @@ private:
     std::unique_ptr<GaussianSplatPackedAttrs> merged_gs_attrs_;
 
     /// Pack one object's splats and store in per_object_gs_attrs_.
+    // Check finite shared lighting and agreement before changing any geometry.
+    void ValidateGaussianSplatLighting(const std::string& name,
+                                      const MaterialRecord& material) const;
     void CacheGaussianSplatData(const std::string& name,
                                 const t::geometry::PointCloud& cloud,
                                 const MaterialRecord& material);

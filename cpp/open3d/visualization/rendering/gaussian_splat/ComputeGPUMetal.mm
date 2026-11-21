@@ -39,6 +39,7 @@ static const NSUInteger kThreadsPerGroup[][3] = {
         {256, 1, 1},  // kGsRadixScatter
         {1, 1, 1},    // kGsDispatchArgs
         {16, 16, 1},  // kGsDepthMerge
+        {128, 1, 1},  // kGsDexel
 };
 static_assert(std::size(kThreadsPerGroup) ==
                       static_cast<std::size_t>(ComputeProgramId::kCount),

@@ -271,7 +271,9 @@ public:
     }
 
 private:
-    GaussianSplatRenderer::RenderConfig config_;
+    // Observe material capacity changes after backend creation, as Metal does.
+    // The owning renderer outlives the backend and stores this config.
+    const GaussianSplatRenderer::RenderConfig& config_;
     std::unique_ptr<GaussianSplatGpuContext> gpu_;
     std::unordered_map<const FilamentView*, GaussianSplatViewGpuResources>
             view_states_;

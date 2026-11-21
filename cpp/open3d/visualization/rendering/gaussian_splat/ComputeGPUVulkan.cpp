@@ -60,10 +60,8 @@ struct ShaderBindingDesc {
 static constexpr ShaderBindingDesc kBindingsProject[] = {
         {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_IMAGE_LAYOUT_UNDEFINED},
         {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_IMAGE_LAYOUT_UNDEFINED},
-        {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_IMAGE_LAYOUT_UNDEFINED},
         {3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_IMAGE_LAYOUT_UNDEFINED},
         {4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_IMAGE_LAYOUT_UNDEFINED},
-        {5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_IMAGE_LAYOUT_UNDEFINED},
         {6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_IMAGE_LAYOUT_UNDEFINED},
         {7, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_IMAGE_LAYOUT_UNDEFINED},
         {8, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_IMAGE_LAYOUT_UNDEFINED},
@@ -110,6 +108,14 @@ static constexpr ShaderBindingDesc kBindingsDepthMerge[] = {
          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
 };
 
+static constexpr ShaderBindingDesc kBindingsDexel[] = {
+        {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_IMAGE_LAYOUT_UNDEFINED},
+        {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_IMAGE_LAYOUT_UNDEFINED},
+        {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_IMAGE_LAYOUT_UNDEFINED},
+        {3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_IMAGE_LAYOUT_UNDEFINED},
+        {4, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_IMAGE_LAYOUT_UNDEFINED},
+};
+
 // Table indexed by ComputeProgramId: binding descriptor + count.
 struct ShaderBindingTable {
     const ShaderBindingDesc* descs;
@@ -123,6 +129,7 @@ static constexpr ShaderBindingTable kShaderBindings[] = {
         {kBindingsRadixScatter, std::size(kBindingsRadixScatter)},
         {kBindingsDispatchArgs, std::size(kBindingsDispatchArgs)},
         {kBindingsDepthMerge, std::size(kBindingsDepthMerge)},
+        {kBindingsDexel, std::size(kBindingsDexel)},
 };
 static_assert(std::size(kShaderBindings) ==
                       static_cast<std::size_t>(ComputeProgramId::kCount),
@@ -279,6 +286,17 @@ public:
     std::uintptr_t CreateBuffer(std::size_t size,
                                 const char* label = nullptr) override {
         return AllocBuf(size, false, label);
+    }
+
+    std::uintptr_t CreateReadbackBuffer(std::size_t size,
+                                        const char* label = nullptr) override {
+        return AllocBuf(size, false, label, true);
+    }
+
+    std::uintptr_t ResizeReadbackBuffer(std::uintptr_t buf,
+                                        std::size_t new_size,
+                                        const char* label = nullptr) override {
+        return ReallocBuf(buf, new_size, false, label, true);
     }
 
     std::uintptr_t CreatePrivateBuffer(std::size_t size,
@@ -453,6 +471,19 @@ public:
                 vk::AccessFlagBits2::eMemoryRead |
                         vk::AccessFlagBits2::eMemoryWrite |
                         vk::AccessFlagBits2::eIndirectCommandRead,
+        };
+        cmd_.pipelineBarrier2(vk::DependencyInfo{{}, mb, {}, {}});
+    }
+
+    void ReadbackBarrier() override {
+        // Cached host reads need availability after shader writes as well as
+        // the submission fence and non-coherent cache invalidation.
+        vk::MemoryBarrier2 mb{
+                vk::PipelineStageFlagBits2::eComputeShader |
+                        vk::PipelineStageFlagBits2::eTransfer,
+                vk::AccessFlagBits2::eMemoryWrite,
+                vk::PipelineStageFlagBits2::eHost,
+                vk::AccessFlagBits2::eHostRead,
         };
         cmd_.pipelineBarrier2(vk::DependencyInfo{{}, mb, {}, {}});
     }
@@ -634,6 +665,7 @@ private:
         std::size_t size = 0;
         void* mapped = nullptr;
         bool is_private = false;
+        bool is_readback = false;
     };
     std::unordered_map<uintptr_t, BufEntry> buffers_;
 
@@ -1104,7 +1136,10 @@ private:
 
     // --- Buffer allocation ------------------------------------------------
 
-    std::uintptr_t AllocBuf(std::size_t size, bool priv, const char* label) {
+    std::uintptr_t AllocBuf(std::size_t size,
+                            bool priv,
+                            const char* label,
+                            bool readback = false) {
         if (size == 0) return 0;
         VkBufferCreateInfo bci{};
         bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
@@ -1120,8 +1155,10 @@ private:
         if (priv) {
             aci.usage = VMA_MEMORY_USAGE_GPU_ONLY;
         } else {
-            aci.usage = VMA_MEMORY_USAGE_CPU_TO_GPU;
+            aci.usage = readback ? VMA_MEMORY_USAGE_GPU_TO_CPU
+                                 : VMA_MEMORY_USAGE_CPU_TO_GPU;
             aci.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT;
+            if (readback) aci.preferredFlags = VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
         }
 
         VmaAllocation alloc = VK_NULL_HANDLE;
@@ -1138,6 +1175,7 @@ private:
         e.size = size;
         e.mapped = priv ? nullptr : info.pMappedData;
         e.is_private = priv;
+        e.is_readback = readback;
         NameObject(vk::ObjectType::eBuffer,
                    reinterpret_cast<std::uintptr_t>(buf), label);
         return handle;
@@ -1148,13 +1186,15 @@ private:
     std::uintptr_t ReallocBuf(std::uintptr_t buf,
                               std::size_t new_size,
                               bool priv,
-                              const char* label) {
+                              const char* label,
+                              bool readback = false) {
         auto it = buffers_.find(buf);
         if (it != buffers_.end()) {
-            if (it->second.size == new_size) return buf;
+            if (it->second.size == new_size && it->second.is_private == priv &&
+                it->second.is_readback == readback) return buf;
             DestroyBuffer(buf);
         }
-        return AllocBuf(new_size, priv, label);
+        return AllocBuf(new_size, priv, label, readback);
     }
 
     // --- Texture/image allocation -----------------------------------------

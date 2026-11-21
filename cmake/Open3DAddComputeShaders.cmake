@@ -15,7 +15,7 @@ set(_Open3DAddComputeShaders_DIR "${CMAKE_CURRENT_LIST_DIR}" CACHE INTERNAL "")
 # On Apple, the .metal files are bundled into a single .metallib file for runtime loading
 # (newLibraryWithFile / newLibraryWithData), avoiding newLibraryWithSource.
 function(open3d_add_compute_shaders target)
-    cmake_parse_arguments(PARSE_ARGV 1 ARG "" "OUTPUT_DIRECTORY" "SOURCES")
+    cmake_parse_arguments(PARSE_ARGV 1 ARG "" "OUTPUT_DIRECTORY" "SOURCES;INCLUDE_FILES")
 
     if (ARG_UNPARSED_ARGUMENTS)
         message(FATAL_ERROR "Unknown arguments: ${ARG_UNPARSED_ARGUMENTS}")
@@ -52,6 +52,24 @@ function(open3d_add_compute_shaders target)
     # them.  Most compute shaders use subgroup ops and therefore need -V.
     set(GLSLANG_FLAGS -V --target-env vulkan1.3 -gVS)
 
+    # Stage shared source for reproducible installed-resource verification,
+    # and make each consuming shader rebuild when a shared include changes.
+    set(COMPUTE_INCLUDE_PATHS "")
+    foreach(shader_include IN LISTS ARG_INCLUDE_FILES)
+        get_filename_component(INCLUDE_PATH "${shader_include}" ABSOLUTE)
+        get_filename_component(INCLUDE_NAME "${shader_include}" NAME)
+        set(STAGED_INCLUDE "${OUTPUT_DIRECTORY_FULL_PATH}/${INCLUDE_NAME}")
+        add_custom_command(
+            OUTPUT ${STAGED_INCLUDE}
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    ${INCLUDE_PATH} ${STAGED_INCLUDE}
+            MAIN_DEPENDENCY ${INCLUDE_PATH}
+            VERBATIM
+        )
+        list(APPEND COMPUTE_INCLUDE_PATHS "${INCLUDE_PATH}")
+        list(APPEND STAGED_COMPUTE_SHADERS "${STAGED_INCLUDE}")
+    endforeach()
+
     foreach(shader IN LISTS ARG_SOURCES)
         get_filename_component(SHADER_FULL_PATH "${shader}" ABSOLUTE)
         get_filename_component(SHADER_NAME "${shader}" NAME)
@@ -76,6 +94,7 @@ function(open3d_add_compute_shaders target)
                     ${SHADER_FULL_PATH} -o ${STAGED_SPIRV_FULL_PATH}
             COMMENT "Compiling compute shader ${SHADER_NAME} to SPIR-V"
             MAIN_DEPENDENCY ${shader}
+            DEPENDS ${COMPUTE_INCLUDE_PATHS}
             VERBATIM
         )
         if (APPLE)

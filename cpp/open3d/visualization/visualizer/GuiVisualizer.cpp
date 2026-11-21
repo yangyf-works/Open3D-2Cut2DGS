@@ -1045,8 +1045,6 @@ void GuiVisualizer::SetGeometry(
         if (pcd) {
             if (pcd->IsGaussianSplat()) {
                 loaded_material.shader = "gaussianSplat";
-                loaded_material.gaussian_splat_sh_degree =
-                        pcd->GaussianSplatGetSHOrder();
             } else if (pcd->HasPointNormals()) {
                 loaded_material.shader = "defaultLit";
             } else if (pcd->HasPointColors()) {

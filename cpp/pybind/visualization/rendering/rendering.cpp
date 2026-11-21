@@ -18,6 +18,7 @@
 #include "open3d/visualization/rendering/View.h"
 #include "open3d/visualization/rendering/filament/FilamentEngine.h"
 #include "open3d/visualization/rendering/filament/FilamentRenderer.h"
+#include "open3d/visualization/rendering/gaussian_splat/GaussianSplatRayQuery.h"
 #include "pybind/docstring.h"
 #include "pybind/visualization/gui/gui.h"
 #include "pybind/visualization/visualization.h"
@@ -108,6 +109,9 @@ private:
 
 void pybind_rendering_declarations(py::module &m) {
     py::module m_rendering = m.def_submodule("rendering");
+    py::class_<GaussianSplatRayQuery>(m_rendering, "GaussianSplatRayQuery",
+        "Synchronous all-candidate Vulkan surface ray query. "
+        "Shares ray intersection code with Gaussian rendering.");
     py::class_<TextureHandle> texture_handle(m_rendering, "TextureHandle",
                                              "Handle to a texture");
     py::class_<Renderer> renderer(
@@ -233,6 +237,26 @@ void pybind_rendering_declarations(py::module &m) {
 }
 void pybind_rendering_definitions(py::module &m) {
     auto m_rendering = static_cast<py::module>(m.attr("rendering"));
+    auto ray_query = static_cast<py::class_<GaussianSplatRayQuery>>(
+            m_rendering.attr("GaussianSplatRayQuery"));
+    ray_query.def(py::init([](const std::string& resource_path) {
+                      gui::InitializeForPython(resource_path, true);
+                      return std::make_unique<GaussianSplatRayQuery>();
+                  }), "resource_path"_a = "",
+                  "Initialize resources; the first nonempty query creates "
+                  "GPU programs. Close before destroying a renderer.")
+            .def("query", &GaussianSplatRayQuery::Query,
+                 "geometry"_a, "spans"_a, "planes"_a,
+                 "Evaluate CPU Float32 [R,4,4] geometry, UInt32 [R,8] spans "
+                 "and Float32 [P,4] clipping planes. Uploads and synchronous "
+                 "readback are explicit parts of this call. Returns CPU "
+                 "Float32 [C,4] (depth,u,v,rho); missed depths are NaN. "
+                 "No per-ray layer cap; oversized buffers raise an error. "
+                 "Run on the creating/render thread without concurrent GPU "
+                 "renderer work. Vulkan hardware required.")
+            .def("close", &GaussianSplatRayQuery::Close,
+                 "Release query buffers and pipelines before renderer/device "
+                 "teardown. The closed query cannot be reused.");
     auto renderer =
             static_cast<py::class_<Renderer>>(m_rendering.attr("Renderer"));
     renderer.def("set_clear_color", &Renderer::SetClearColor,
@@ -449,14 +473,44 @@ void pybind_rendering_definitions(py::module &m) {
             .def_readwrite("aspect_ratio", &MaterialRecord::aspect_ratio)
             .def_readwrite("ground_plane_axis",
                            &MaterialRecord::ground_plane_axis)
-            .def_readwrite("gaussian_splat_sh_degree",
-                           &MaterialRecord::gaussian_splat_sh_degree,
-                           "Max SH degree for Gaussian splat rendering (0-2).")
             .def_readwrite(
                     "gaussian_splat_min_alpha",
                     &MaterialRecord::gaussian_splat_min_alpha,
-                    "Minimum opacity threshold for Gaussian splat rendering "
-                    "(0.0-1.0).  Splats with alpha below this are discarded.")
+                    "Minimum center alpha for transparent Gaussian objects. "
+                    "All GS have fixed alpha 0.99; a threshold above 0.99 "
+                    "excludes the whole object. Opaque surfaces ignore it.")
+            .def_readwrite(
+                    "gaussian_splat_surface_lighting",
+                    &MaterialRecord::gaussian_splat_surface_lighting,
+                    "Scene-wide Gaussian Phong ambient/diffuse/specular triple. "
+                    "Finite and nonnegative; default [1,0,0] shows unlit RGB. "
+                    "All Gaussian objects in the same scene must agree. "
+                    "Set before adding geometry; remove/re-add all Gaussian "
+                    "objects to change it. Per-GS surface_lighting is unsupported.")
+            .def_readwrite(
+                    "gaussian_splat_surface_shininess",
+                    &MaterialRecord::gaussian_splat_surface_shininess,
+                    "Scene-wide Gaussian specular exponent. Finite and strictly "
+                    "positive; default 2 preserves the original highlight. "
+                    "Larger values narrow the highlight. All Gaussian objects "
+                    "in the same scene must agree. Set before adding geometry; "
+                    "remove/re-add all Gaussian objects to change it.")
+            .def_readwrite(
+                    "gaussian_splat_opaque_surface",
+                    &MaterialRecord::gaussian_splat_opaque_surface,
+                    "Normalize Gaussian-weighted normals and albedo on the "
+                    "coverage-selected surface, then shade it opaquely. "
+                    "Both modes use Float32 surface_color (N,3) and the same "
+                    "gaussian_splat_surface_lighting Phong coefficients. "
+                    "Normal mode uses each GS normal; this mode interpolates "
+                    "normals on the same surface. f_dc and f_rest are unsupported. "
+                    "Optional Int32 surface_id (N,1) groups samples within "
+                    "one object; zero/missing isolates each sample. "
+                    "Interpolation uses Gaussian-only weights. Per-GS opacity "
+                    "attributes are unsupported. "
+                    "Below 50% reference coverage, partial Gaussian support "
+                    "is composited in exact depth order instead of forced opaque. "
+                    "Both clip planes and actual per-pixel depth are retained.")
             .def_readwrite(
                     "gaussian_splat_antialias",
                     &MaterialRecord::gaussian_splat_antialias,

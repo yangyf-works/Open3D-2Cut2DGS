@@ -1,0 +1,86 @@
+// ----------------------------------------------------------------------------
+// -                        Open3D: www.open3d.org                            -
+// ----------------------------------------------------------------------------
+// Copyright (c) 2018-2026 www.open3d.org
+// SPDX-License-Identifier: MIT
+// ----------------------------------------------------------------------------
+
+// All geometric intersections for finite Gaussian surface regions. Each
+// projected rectangle reserves one output per grid candidate: no opacity,
+// first-hit stop or fixed per-ray layer limit can remove a back surface.
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "gaussian_ray_intersection.glsl"
+
+layout(local_size_x = 128) in;
+
+struct RayRegion {
+    vec4 row_x_depth_u;
+    vec4 row_y_depth_v;
+    vec4 row_w_depth_c;
+    // XY = grid origin, Z = pitch, W = intersection determinant epsilon.
+    vec4 grid;
+};
+
+struct RaySpan {
+    // Candidate begin/end (exclusive), then first grid I/J.
+    uvec4 candidates_origin;
+    // Rectangle J width, first clip plane, clip plane count, reserved.
+    uvec4 width_planes;
+};
+
+layout(std430, binding = 0) restrict readonly buffer RayGeometry {
+    RayRegion regions[];
+};
+layout(std430, binding = 1) restrict readonly buffer RaySpans {
+    RaySpan spans[];
+};
+layout(std430, binding = 2) restrict readonly buffer RayPlanes {
+    vec4 clip_planes[];
+};
+layout(std430, binding = 3) restrict writeonly buffer RayHits {
+    // Depth, local U, local V, squared UV distance; NaN depth means no hit.
+    vec4 hits[];
+};
+layout(std140, binding = 4) uniform RayQueryParams {
+    // Region count, candidate count, reserved, reserved.
+    uvec4 counts;
+} query;
+
+void main() {
+    uint group = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+    uint candidate = group * 128u + gl_LocalInvocationID.x;
+    if (candidate >= query.counts.y) return;
+    hits[candidate] = vec4(uintBitsToFloat(0x7fc00000u));
+
+    // Spans are contiguous and increasing, checked by the host. Binary search
+    // allows one dispatch without materialising a candidate-to-region array.
+    uint low = 0u;
+    uint high = query.counts.x;
+    while (low < high) {
+        uint mid = low + (high - low) / 2u;
+        if (candidate >= spans[mid].candidates_origin.y) low = mid + 1u;
+        else high = mid;
+    }
+    if (low >= query.counts.x) return;
+    RaySpan span = spans[low];
+    RayRegion region = regions[low];
+    uint offset = candidate - span.candidates_origin.x;
+    uint width = span.width_planes.x;
+    uvec2 cell = span.candidates_origin.zw + uvec2(offset / width, offset % width);
+    vec2 pixel_center = region.grid.xy + (vec2(cell) + vec2(0.5)) * region.grid.z;
+
+    vec2 local_uv;
+    if (!GaussianRayLocalUV(pixel_center, region.row_x_depth_u.xyz,
+                            region.row_y_depth_v.xyz, region.row_w_depth_c.xyz,
+                            region.grid.w, local_uv)) return;
+    for (uint i = 0u; i < span.width_planes.z; ++i) {
+        if (GaussianRayOutsideClip(local_uv,
+                                   clip_planes[span.width_planes.y + i].xyz)) return;
+    }
+
+    float depth = GaussianRayDepth(local_uv, region.row_x_depth_u.w,
+                                   region.row_y_depth_v.w, region.row_w_depth_c.w);
+    if (isnan(depth) || isinf(depth)) return;
+    hits[candidate] = vec4(depth, local_uv, dot(local_uv, local_uv));
+}

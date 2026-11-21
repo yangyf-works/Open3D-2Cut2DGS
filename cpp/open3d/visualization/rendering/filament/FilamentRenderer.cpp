@@ -148,12 +148,6 @@ TextureHandle FilamentRenderer::GetGaussianSplatDepthTexture(
                    : TextureHandle();
 }
 
-int FilamentRenderer::GetGaussianSplatMaxShDegree() const {
-    return gaussian_splat_renderer_
-                   ? gaussian_splat_renderer_->GetRenderConfig().max_sh_degree
-                   : 2;
-}
-
 void FilamentRenderer::InvalidateGaussianSplatOutput(FilamentView& view) {
     if (gaussian_splat_renderer_) {
         gaussian_splat_renderer_->InvalidateOutputForView(view);

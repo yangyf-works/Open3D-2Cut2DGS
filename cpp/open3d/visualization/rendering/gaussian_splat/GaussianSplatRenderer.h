@@ -42,7 +42,6 @@ public:
         Eigen::Vector2i tile_size = Eigen::Vector2i(16, 16);
         int projection_group_size = 64;
         Eigen::Vector2i composite_group_size = Eigen::Vector2i(16, 16);
-        int max_sh_degree = 2;
         // Hard cap on tiles per splat; splats exceeding it are culled rather
         // than cropped. Cropping huge splats can create hard-edged opaque
         // blocks. The cap is independent of buffer sizing, so raising it does

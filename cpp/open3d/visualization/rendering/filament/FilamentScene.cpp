@@ -16,6 +16,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <stdexcept>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -479,9 +480,49 @@ const GaussianSplatPackedAttrs* FilamentScene::GetGaussianSplatPackedAttrs()
     return merged_gs_attrs_.get();
 }
 
+// Validate the single scene-wide lighting value before replacing scene/cache
+// state. Hidden Gaussian objects also retain the same lighting contract.
+void FilamentScene::ValidateGaussianSplatLighting(
+        const std::string& name, const MaterialRecord& material) const {
+    const auto& lighting = material.gaussian_splat_surface_lighting;
+    const float shininess = material.gaussian_splat_surface_shininess;
+    if (!lighting.allFinite() || (lighting.array() < 0.f).any()) {
+        throw std::invalid_argument(
+                "gaussian_splat_surface_lighting must contain finite "
+                "nonnegative ambient, diffuse and specular coefficients.");
+    }
+    if (!std::isfinite(shininess) || shininess <= 0.f) {
+        throw std::invalid_argument(
+                "gaussian_splat_surface_shininess must be finite "
+                "and strictly positive.");
+    }
+    for (const auto& item : per_object_gs_attrs_) {
+        if (item.first == name) continue;
+        if ((item.second.surface_lighting.array() != lighting.array()).any()) {
+            throw std::invalid_argument(
+                    "All Gaussian objects in one scene must use the same "
+                    "gaussian_splat_surface_lighting. Remove/re-add all "
+                    "Gaussian objects to change the shared coefficients.");
+        }
+        if (item.second.surface_shininess != shininess) {
+            throw std::invalid_argument(
+                    "All Gaussian objects in one scene must use the same "
+                    "gaussian_splat_surface_shininess. Remove/re-add all "
+                    "Gaussian objects to change the shared exponent.");
+        }
+    }
+}
+
 void FilamentScene::CacheGaussianSplatData(const std::string& name,
                                            const t::geometry::PointCloud& cloud,
                                            const MaterialRecord& material) {
+    ValidateGaussianSplatLighting(name, material);
+    // Updates reach this cache directly. Validate the scalar-scale schema before
+    // interpreting raw pointers or replacing the existing packed geometry.
+    if (!cloud.IsGaussianSplat()) {
+        utility::LogError("Gaussian splats require positions, scale (N,1), "
+                          "rot and surface_color attributes.");
+    }
     const auto& points = cloud.GetPointPositions();
     const size_t n = points.GetLength();
 
@@ -489,90 +530,67 @@ void FilamentScene::CacheGaussianSplatData(const std::string& name,
     auto pts = points.To(core::Float32).Contiguous();
     const float* pts_ptr = pts.GetDataPtr<float>();
 
-    std::string missing;
-    const bool has_scale = cloud.HasPointAttr("scale");
-    core::Tensor scale_attr;
-    const float* scale_ptr = nullptr;
-    if (has_scale) {
-        scale_attr = cloud.GetPointAttr("scale").To(core::Float32).Contiguous();
-        scale_ptr = scale_attr.GetDataPtr<float>();
-    } else {
-        missing += "scale, ";
-    }
+    auto scale_attr = cloud.GetPointAttr("scale").To(core::Float32).Contiguous();
+    auto rot_attr = cloud.GetPointAttr("rot").To(core::Float32).Contiguous();
+    const float* scale_ptr = scale_attr.GetDataPtr<float>();
+    const float* rot_ptr = rot_attr.GetDataPtr<float>();
 
-    const bool has_rot = cloud.HasPointAttr("rot");
-    core::Tensor rot_attr;
-    const float* rot_ptr = nullptr;
-    if (has_rot) {
-        rot_attr = cloud.GetPointAttr("rot").To(core::Float32).Contiguous();
-        rot_ptr = rot_attr.GetDataPtr<float>();
-    } else {
-        missing += "rot, ";
+    // Canonicalize clipping before replacing the cached object. The basic
+    // Gaussian tensors remain shared; only four scalar clip arrays are copied.
+    const auto canonical = cloud.NormalizeGaussianSplatClipping();
+    const float* clip1_angle =
+            canonical.GetPointAttr("clip1_angle").GetDataPtr<float>();
+    const float* clip1_split =
+            canonical.GetPointAttr("clip1_split").GetDataPtr<float>();
+    const float* clip2_angle =
+            canonical.GetPointAttr("clip2_angle").GetDataPtr<float>();
+    const float* clip2_split =
+            canonical.GetPointAttr("clip2_split").GetDataPtr<float>();
+    std::vector<GaussianSplatClipData> clipping(n);
+    for (size_t i = 0; i < n; ++i) {
+        clipping[i] = {clip1_angle[i], clip1_split[i], clip2_angle[i],
+                       clip2_split[i]};
     }
-
-    const bool has_f_dc = cloud.HasPointAttr("f_dc");
-    const bool has_opacity = cloud.HasPointAttr("opacity");
-    core::Tensor f_dc_attr, opacity_attr;
-    const float* f_dc_ptr = nullptr;
-    const float* opacity_ptr = nullptr;
-    if (has_f_dc) {
-        f_dc_attr = cloud.GetPointAttr("f_dc").To(core::Float32).Contiguous();
-        f_dc_ptr = f_dc_attr.GetDataPtr<float>();
-    } else {
-        missing += "f_dc, ";
+    GaussianSplatSurfaceData surface;
+    surface.opaque = material.gaussian_splat_opaque_surface;
+    core::Tensor surface_ids, surface_colors;
+    if (n > 0) {
+        const auto require = [&](const char* attr, const core::Dtype& dtype,
+                                 int width) {
+            if (!cloud.GetPointAttr().Contains(attr)) {
+                utility::LogError("Gaussian object '{}' requires '{}'.", name, attr);
+            }
+            const auto& value = cloud.GetPointAttr(attr);
+            if (!value.GetDevice().IsCPU() || value.GetDtype() != dtype ||
+                value.GetShape() != core::SizeVector{static_cast<int64_t>(n), width}) {
+                utility::LogError("Gaussian attribute '{}' must be CPU dtype {} and shape ({}, {}).",
+                                  attr, dtype.ToString(), n, width);
+            }
+            return value.Contiguous();
+        };
+        surface_colors = require("surface_color", core::Float32, 3);
+        surface.colors = surface_colors.GetDataPtr<float>();
+        // Presence must not depend on length: malformed optional IDs must
+        // fail validation instead of silently becoming unknown surfaces.
+        if (cloud.GetPointAttr().Contains("surface_id")) {
+            surface_ids = require("surface_id", core::Int32, 1);
+            surface.ids = surface_ids.GetDataPtr<int32_t>();
+        }
     }
-    if (has_opacity) {
-        opacity_attr =
-                cloud.GetPointAttr("opacity").To(core::Float32).Contiguous();
-        opacity_ptr = opacity_attr.GetDataPtr<float>();
-    } else {
-        missing += "opacity, ";
-    }
-    if (n > 0 && !missing.empty()) {
-        utility::LogWarning(
-                "Gaussian splat object '{}': missing required point "
-                "attribute(s): {}. The object will not be displayed.",
-                name, missing.substr(0, missing.size() - 2) + ".");
-        per_object_gs_attrs_.erase(name);
-        return;
-    }
-    const bool has_f_rest = cloud.HasPointAttr("f_rest");
-    core::Tensor f_rest_attr;
-    const float* f_rest_ptr = nullptr;
-    if (has_f_rest) {
-        f_rest_attr =
-                cloud.GetPointAttr("f_rest").To(core::Float32).Contiguous();
-        f_rest_ptr = f_rest_attr.GetDataPtr<float>();
-    }
-
-    // Determine effective SH degree: clamp by source, material, and renderer.
-    int cloud_sh = cloud.GaussianSplatGetSHOrder();
-    int desired_sh = std::min(cloud_sh, material.gaussian_splat_sh_degree);
-    if (auto* renderer = dynamic_cast<const FilamentRenderer*>(&renderer_)) {
-        desired_sh =
-                std::min(desired_sh, renderer->GetGaussianSplatMaxShDegree());
-    }
-
-    // Convert min_alpha from sigmoid space to logit space for the opacity
-    // filter.  The projection shader stores opacity in logit (pre-sigmoid)
-    // space, so the threshold must be in the same domain.
-    // sigmoid(x) = 1/(1+exp(-x))  =>  x = log(a/(1-a))
-    const float min_alpha_sigmoid = material.gaussian_splat_min_alpha;
-    float min_opacity_logit = -std::numeric_limits<float>::infinity();
-    if (min_alpha_sigmoid > 0.0f && min_alpha_sigmoid < 1.0f) {
-        min_opacity_logit =
-                std::log(min_alpha_sigmoid / (1.0f - min_alpha_sigmoid));
-    } else if (min_alpha_sigmoid >= 1.0f) {
-        min_opacity_logit = std::numeric_limits<float>::infinity();
-    }
-
-    // Pack directly into GPU-ready format in one pass (filter + compress).
-    auto& packed = per_object_gs_attrs_[name];
-    packed = GaussianSplatPackedAttrs{};
-    PackGaussianSplatAttrsDirect(pts_ptr, n, scale_ptr, rot_ptr, f_dc_ptr,
-                                 opacity_ptr, f_rest_ptr, cloud_sh, desired_sh,
-                                 min_opacity_logit,
-                                 material.gaussian_splat_antialias, packed);
+    GaussianSplatPackedAttrs packed;
+    // The existing material threshold now accepts or rejects the entire
+    // transparent object: every GS has the same fixed center alpha.
+    const size_t packed_count = !surface.opaque &&
+                                        material.gaussian_splat_min_alpha >
+                                                kGaussianSplatFixedAlpha
+                                ? 0
+                                : n;
+    PackGaussianSplatAttrsDirect(pts_ptr, packed_count, scale_ptr, rot_ptr,
+                                 material.gaussian_splat_antialias, packed,
+                                 clipping.data(), &surface);
+    packed.surface_lighting = material.gaussian_splat_surface_lighting;
+    packed.surface_shininess = material.gaussian_splat_surface_shininess;
+    per_object_gs_attrs_[name] = std::move(packed);
 }
 
 void FilamentScene::RebuildMergedGaussianData() {
@@ -753,6 +771,17 @@ bool FilamentScene::AddGeometry(const std::string& object_name,
                                 const MaterialRecord& material,
                                 const std::string& downsampled_name /*= ""*/,
                                 size_t downsample_threshold /*= SIZE_MAX*/) {
+    // Reject unsupported clipping even for empty or non-Gaussian point clouds,
+    // before replacing an existing scene object or allocating GPU resources.
+    if (const auto* cloud =
+                dynamic_cast<const t::geometry::PointCloud*>(&geometry)) {
+        cloud->ValidateGaussianSplatClipping();
+        const bool is_gaussian = cloud->IsGaussianSplat();
+        if (material.shader == "gaussianSplat" && !is_gaussian) {
+            utility::LogError("Gaussian splats require scale (N,1) and the "
+                              "remaining Gaussian attributes.");
+        }
+    }
     // Basic sanity checks
     if (geometry.IsEmpty()) {
         utility::LogWarning("Geometry for object {} is empty", object_name);
@@ -771,9 +800,6 @@ bool FilamentScene::AddGeometry(const std::string& object_name,
                 "Gaussian splat rendering requires Open3D's patched Filament "
                 "library on this platform.");
 #endif
-        if (geometries_.count(object_name)) {
-            RemoveGeometry(object_name);
-        }
         MaterialRecord internal_material = material;
         auto* drawable = dynamic_cast<const t::geometry::DrawableGeometry*>(pc);
         if (drawable && drawable->HasMaterial()) {
@@ -782,6 +808,10 @@ bool FilamentScene::AddGeometry(const std::string& object_name,
             // MTL name, which is never "gaussianSplat" and is not a reliable
             // signal for whether the API intended compute rendering.
             drawable->GetMaterial().ToMaterialRecord(internal_material);
+        }
+        ValidateGaussianSplatLighting(object_name, internal_material);
+        if (geometries_.count(object_name)) {
+            RemoveGeometry(object_name);
         }
         auto& geom = geometries_[object_name];
         geom.name = object_name;
@@ -975,6 +1005,8 @@ bool FilamentScene::HasGeometry(const std::string& object_name) const {
 void FilamentScene::UpdateGeometry(const std::string& object_name,
                                    const t::geometry::PointCloud& point_cloud,
                                    uint32_t update_flags) {
+    point_cloud.ValidateGaussianSplatClipping();
+    point_cloud.IsGaussianSplat();  // Reject malformed GS before any update.
     auto geoms = GetGeometry(object_name, false);
     if (!geoms.empty()) {
         // 3D Gaussian Splatting is rendered via compute shaders; refresh CPU

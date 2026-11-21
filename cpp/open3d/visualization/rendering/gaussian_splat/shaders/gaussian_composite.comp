@@ -5,11 +5,12 @@
 // SPDX-License-Identifier: MIT
 // ----------------------------------------------------------------------------
 
-// Gaussian splat composite pass.
+// 2D Gaussian surfel composite pass.
 //
-// Pixels traverse the sorted tile-local splat list, accumulate front-to-back
-// premultiplied color, and store a nearest-hit depth that Filament can later
-// use during scene composition.
+// Pixels select surfel intersections by actual ray depth within each tile.
+// Transparent surfaces composite front-to-back. Opaque ownership follows
+// reference Gaussian coverage, then normal/albedo weights reconstruct only
+// that surface. Center-depth keys only group candidate splats by tile.
 //
 // Compiled with glslangValidator -V --target-env vulkan1.3 (Vulkan SPIR-V).
 // Image binding 16 is used for out_color (instead of the natural 0) to avoid
@@ -20,9 +21,9 @@
 // Opt1: Zero-copy output — the VkImage written here is imported directly
 //       into Filament via Texture::Builder::import(), eliminating the
 //       staging-buffer round-trip.
-// Opt4b: ProjectedComposite (32 B, binding 6) packs center/depth/alpha/color
-//        and inv_basis into one struct — one 32 B SSBO fetch per splat instead
-//        of two 16 B fetches from separate buffers, halving L2 cache lookups.
+// Opt4b: ProjectedComposite (104 B, binding 6) stores color, three
+//        projective/depth rows and four FP32 clipping angle/split values.
+//        The conic center and boundary normals are computed cooperatively.
 // Opt7: Shared-memory cooperative tile loading — the workgroup loads batches
 //       of splat data into shared memory, then all 256 threads evaluate from
 //       shared memory instead of 256 independent global reads.
@@ -38,21 +39,34 @@
 
 #version 460
 
+#extension GL_GOOGLE_include_directive : require
+#include "gaussian_ray_intersection.glsl"
+
 #extension GL_KHR_shader_subgroup_basic : enable
 #extension GL_KHR_shader_subgroup_arithmetic : enable
 
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
-// Composite-pass projected data (32 B, binding 6).
-// All fields needed by the composite pass are packed into a single struct so
-// the cooperative load issues one 32 B SSBO read per splat instead of two
-// separate reads from binding 6 and a former binding 13.
+// Composite-pass projected 2D surfel data (104 B, binding 6).
+// This layout must exactly match gaussian_project.comp and the C++
+// ProjectedComposite structure in GaussianSplatDataPacking.h.
 struct ProjectedComposite {
-    uint center_xy_fp16;  // packHalf2x16(center_x, center_y) viewport pixels
-    float depth;
-    float alpha;
-    uint packed_rgba8;
-    vec4 inv_basis;  // 2×2 inverse covariance basis, row-major
+    // vec2 pairs retain FP32 projective/depth rows without vec4 padding.
+    vec2 row_x_xy;
+    vec2 row_x_zw;
+    vec2 row_y_xy;
+    vec2 row_y_zw;
+    vec2 row_w_xy;
+    vec2 row_w_zw;
+    // Four consecutive FP32 values; inactive angle = 4, split = 0.
+    vec2 clip1_angle_split;
+    vec2 clip2_angle_split;
+    uint surface_id;
+    uint surface_flags;
+    vec2 surface_normal_xy;
+    vec2 surface_normal_z_sigma;
+    vec2 surface_color_rg;
+    vec2 surface_color_b_reserved;
 };
 
 layout(std140, binding = 0) uniform GaussianViewParams {
@@ -65,6 +79,8 @@ layout(std140, binding = 0) uniform GaussianViewParams {
     uvec4 tiles;
     uvec4 limits;
     vec4 depth_range_and_flags;
+    // One Phong triple for every GS; w is reserved and zero.
+    vec4 surface_lighting;
 }
 view_params;
 
@@ -72,7 +88,7 @@ layout(std430, binding = 6) restrict readonly buffer ProjectedComposites {
     ProjectedComposite composite[];
 };
 
-// inv_basis is now inlined in ProjectedComposite (binding 6); no binding 13.
+// All surfel intersection data is in ProjectedComposite; no binding 13.
 
 // Sorted sort keys from the final radix-sort pass (same buffer as project
 // output).  Used for binary search to find each tile's entry range, replacing
@@ -118,7 +134,10 @@ layout(binding = 1, r32f) uniform writeonly image2D out_depth;
 // Bound only when depth_range_and_flags.w > 0.5.
 layout(binding = 14) uniform sampler2D scene_depth;
 
-const float kLog2E = 1.44269504089;  // log2(e) for exp2-based sigmoid
+const float kLog2E = 1.44269504089;  // log2(e) for exp2-based Gaussian
+const float kSurfelCutoffSq = 9.0;   // 3-sigma local cutoff
+const float kFilterInvSquare = 2.0;  // FilterSize = 1 / sqrt(2)
+const float kIntersectionEpsilon = 1e-8;
 
 uvec2 GetTileSize() { return max(view_params.tiles.xy, uvec2(1u)); }
 
@@ -196,30 +215,199 @@ float Linear01ToInverse(float linear_01, float near, float far) {
 }
 
 // Opt7: Shared memory arrays for cooperative tile loading.
-// 256 entries × (8+4+4+16+4) = 9216 bytes.
+// 256 entries x 88 logical bytes, plus 16 B of work-stealing state below.
+// Backend workgroup-memory layout may add padding to the vec3 arrays.
 const uint BATCH_SIZE = 256u;
 shared vec2 s_center[BATCH_SIZE];
-shared float s_alpha[BATCH_SIZE];
-shared float s_depth[BATCH_SIZE];
-shared uint s_color[BATCH_SIZE];
-shared vec4 s_inv_basis[BATCH_SIZE];
+shared uint s_index[BATCH_SIZE];
+shared uint s_flags[BATCH_SIZE];
+shared vec4 s_row_x_depth_u[BATCH_SIZE];
+shared vec4 s_row_y_depth_v[BATCH_SIZE];
+shared vec4 s_row_w_depth_c[BATCH_SIZE];
+// Boundary normals exist only in transient workgroup memory: trig runs once
+// per splat/batch, not per pixel, without enlarging persistent attributes.
+shared vec3 s_clip1[BATCH_SIZE];
+shared vec3 s_clip2[BATCH_SIZE];
 
 // Opt9: Work-stealing shared state.
 // s_stolen_tile: tile index claimed atomically from steal_counter by thread 0.
 // wg_tile_offset/wg_tile_count: tile range found by binary search (thread 0),
 // broadcast to all threads.
-// wg_active_count: counts pixels still accumulating; early-exits the batch
-// loop when all 256 threads are saturated (transmittance ≤ threshold).
+// wg_active_count: pixels that need another sorted-hit round. Every lane
+// participates in shared-memory barriers until all pixels finish.
 shared uint s_stolen_tile;
 shared uint wg_tile_count;
 shared uint wg_tile_offset;
 shared uint wg_active_count;
 
+// Convert a validated angle/split pair to a transient half-plane. Inactive
+// angle 4 produces an always-passing condition, including for off-center UVs.
+vec3 ClipNormalSplit(vec2 angle_split) {
+    const float kPi = 3.14159265358979323846;
+    if (angle_split.x >= -kPi && angle_split.x < kPi) {
+        return vec3(cos(angle_split.x), sin(angle_split.x), angle_split.y);
+    }
+    return vec3(0.0, 0.0, -1.0);
+}
+
+// Load one candidate per lane. All callers synchronize before using the batch.
+void LoadCandidate(uint entry_offset, uint local_index) {
+    uint entry_idx = entry_offset + local_index;
+    uint splat_idx = sorted_splat_indices[entry_idx];
+    ProjectedComposite g = composite[splat_idx];
+    s_flags[local_index] = g.surface_flags;
+    s_index[local_index] = splat_idx;
+    s_row_x_depth_u[local_index] = vec4(g.row_x_xy, g.row_x_zw);
+    s_row_y_depth_v[local_index] = vec4(g.row_y_xy, g.row_y_zw);
+    s_row_w_depth_c[local_index] = vec4(g.row_w_xy, g.row_w_zw);
+    s_clip1[local_index] = ClipNormalSplit(g.clip1_angle_split);
+    s_clip2[local_index] = ClipNormalSplit(g.clip2_angle_split);
+
+    // Reconstruct the same projected conic center produced by
+    // ComputeSurfelAabb() in gaussian_project.comp. This preserves
+    // the existing screen-space low-pass filter exactly without
+    // storing a redundant center in the projected GPU buffer.
+    vec3 row_x = vec3(g.row_x_xy, g.row_x_zw.x);
+    vec3 row_y = vec3(g.row_y_xy, g.row_y_zw.x);
+    vec3 row_w = vec3(g.row_w_xy, g.row_w_zw.x);
+    vec3 conic = vec3(kSurfelCutoffSq,
+                      kSurfelCutoffSq,
+                      -1.0);
+    float denominator = dot(conic, row_w * row_w);
+    vec3 f = conic / denominator;
+    s_center[local_index] =
+            vec2(dot(f, row_x * row_w),
+                 dot(f, row_y * row_w));
+}
+
+
+// The reconstruction pass shares precisely the legacy intersection, support,
+// two-edge clipping and scene-depth tests. All splats use fixed opacity;
+// opaque interpolation uses G while reference coverage uses 0.99 * G.
+bool EvaluateCandidate(uint i, vec2 pixel_center, bool use_scene_depth,
+                       float scene_linear_01, float near, float far,
+                       out float linear_depth, out float alpha) {
+    const float kMinAlpha = 1.0 / 255.0;
+    bool opaque = (s_flags[i] & 1u) != 0u;
+    vec4 row_x_depth_u = s_row_x_depth_u[i];
+    vec4 row_y_depth_v = s_row_y_depth_v[i];
+    vec4 row_w_depth_c = s_row_w_depth_c[i];
+
+    vec2 local_uv;
+    if (!GaussianRayLocalUV(pixel_center, row_x_depth_u.xyz,
+                            row_y_depth_v.xyz, row_w_depth_c.xyz,
+                            kIntersectionEpsilon, local_uv)) {
+        return false;
+    }
+
+    // Reject before Gaussian evaluation or any color/depth
+    // contribution. The accepted boundary is dot(n,uv) >= split.
+    if (GaussianRayOutsideClip(local_uv, s_clip1[i].xyz) ||
+        GaussianRayOutsideClip(local_uv, s_clip2[i].xyz)) {
+        return false;
+    }
+
+    // Gaussian distance on the actual surfel plane.
+    float rho_surface = dot(local_uv, local_uv);
+
+    // Screen-space low-pass filter for sub-pixel surfels.
+    vec2 delta_pixels = pixel_center - s_center[i];
+    float rho_screen =
+            kFilterInvSquare * dot(delta_pixels, delta_pixels);
+    float rho = min(rho_surface, rho_screen);
+    if (rho > kSurfelCutoffSq) {
+        return false;
+    }
+
+    // Evaluate the actual view-space depth at this pixel.
+    linear_depth = GaussianRayDepth(local_uv, row_x_depth_u.w,
+                                    row_y_depth_v.w, row_w_depth_c.w);
+
+    // Also rejects NaN because comparisons with NaN are false.
+    if (!(linear_depth > near && linear_depth < far)) {
+        return false;
+    }
+
+    float pixel_norm_depth =
+            (linear_depth - near) / (far - near);
+
+    // A tilted surfel has different depth at every pixel, so
+    // mesh occlusion must be tested after ray-surfel
+    // intersection rather than with the splat center depth.
+    if (use_scene_depth &&
+        pixel_norm_depth >= scene_linear_01) {
+        return false;
+    }
+
+    // Gaussian support and the transparent cutoff remain unchanged. Opaque
+    // reconstruction needs G itself; reference coverage multiplies it by 0.99.
+    float power = -0.5 * rho;
+    alpha = exp2(power * kLog2E) * (opaque ? 1.0 : 0.99);
+    if (!(alpha > 0.0) || (!opaque && alpha < kMinAlpha)) {
+        return false;
+    }
+    return true;
+}
+
+
+// Both solid and weak-support reconstruction use the identical view ray,
+// surface compatibility and shading rules. Neither stage modifies geometry.
+vec3 SurfaceViewRay(vec2 pixel_center, uvec2 viewport_size) {
+    vec3 ray = vec3(0.0, 0.0, -1.0);
+    if (abs(view_params.clip_from_view[3][3]) < 0.5) {
+        vec2 ndc = 2.0 * pixel_center / vec2(viewport_size) - 1.0;
+        if (view_params.scene.w != 0u) ndc.y = -ndc.y;
+        ray = normalize((inverse(view_params.clip_from_view) *
+                         vec4(ndc, 0.0, 1.0)).xyz);
+    }
+    return ray;
+}
+
+// Add only locally compatible samples of this physical surface. Coverage is
+// separate: Gaussian G weights shading, while 0.99 * G determines coverage.
+void AccumulateSurface(ProjectedComposite anchor, float anchor_depth,
+                       ProjectedComposite candidate, float candidate_depth,
+                       float weight, vec3 ray, inout vec3 normal_sum,
+                       inout vec3 color_sum,
+                       inout float weight_sum) {
+    if (candidate.surface_id != anchor.surface_id) return;
+    vec3 anchor_normal = vec3(anchor.surface_normal_xy,
+                              anchor.surface_normal_z_sigma.x);
+    vec3 normal = vec3(candidate.surface_normal_xy,
+                       candidate.surface_normal_z_sigma.x);
+    if (dot(normal, anchor_normal) < 0.866025403784) return;
+    float slab = 0.5 * anchor.surface_normal_z_sigma.y;
+    float ray_normal_per_z = abs(dot(anchor_normal, ray)) / max(abs(ray.z), 1e-8);
+    if (abs(candidate_depth - anchor_depth) * ray_normal_per_z > slab) return;
+    normal_sum += weight * normal;
+    color_sum += weight * vec3(candidate.surface_color_rg,
+                               candidate.surface_color_b_reserved.x);
+    weight_sum += weight;
+}
+
+// One Phong headlight for both modes: a single GS or compatible weighted data.
+// Shading never changes the selected surface or its actual intersection depth.
+vec3 ShadeSurface(vec3 normal_sum, vec3 color_sum,
+                  float weight_sum, vec3 ray) {
+    vec3 normal = normalize(normal_sum / weight_sum);
+    vec3 color = color_sum / weight_sum;
+    vec3 lighting = view_params.surface_lighting.xyz;
+    float cosine = max(dot(normal, -ray), 0.0);
+    // Preserve the original arithmetic at the default exponent. Larger
+    // exponents narrow the shared camera-facing specular highlight. Clamp
+    // roundoff above one so large finite exponents cannot overflow.
+    float shininess = view_params.surface_lighting.w;
+    float specular = shininess == 2.0 ? lighting.z * cosine * cosine
+                                     : lighting.z * (cosine > 0.0
+                                               ? pow(min(cosine, 1.0), shininess)
+                                               : 0.0);
+    return clamp(color * (lighting.x + lighting.y * cosine) +
+                 vec3(specular), 0.0, 1.0);
+}
+
 void main() {
     const float kSurfaceThreshold =
             0.5;  // Declare surface when transmittance hits this value.
-    const float kMinAlpha =
-            1. / 255;  // Skip splats with alpha less than this value.
     const float kMinTransmittance =
             1.0 /
             4096.0;  // Stop compositing when transmittance hits this value.
@@ -314,92 +502,265 @@ void main() {
         // pick the Filament scene depth via max(gs_inv=0, sc_inv).
         float out_norm_depth = 1.0;
         bool depth_written = false;
+        bool opaque_anchor_found = false;
+        uint opaque_anchor_index = 0u;
+        float opaque_anchor_depth = 0.0;
+        float coverage_transmittance = 1.0;
         vec2 pixel_center = vec2(pixel) + vec2(0.5);
+        // Ordinary and reconstructed surfaces use the same per-pixel headlight.
+        vec3 ray = SurfaceViewRay(pixel_center, viewport_size);
 
         // Convert Filament scene depth (inverse, near=1, far=0) to linear_01
         // once per pixel before the splat loop, so the per-splat occlusion
         // test is a simple float comparison with no per-iteration conversion.
-        float scene_linear_01 = 0.0;  // corresponds to far (no occlusion)
+        float scene_linear_01 = 1.0;  // far plane (no occlusion)
         bool use_scene_depth = has_scene_depth && pixel_active;
         if (use_scene_depth) {
             float scene_inverse_depth = texelFetch(scene_depth, pixel, 0).r;
             scene_linear_01 = InverseToLinear01(scene_inverse_depth, near, far);
         }
 
-        // Opt7: process tile entries in batches of BATCH_SIZE.
-        // ALL threads must iterate the same number of batches to keep
-        // barrier() calls uniform.  Per-pixel early saturation skips
-        // computation but still participates in barriers.
-        for (uint batch_start = 0u; batch_start < my_tile_count;
-             batch_start += BATCH_SIZE) {
-            uint batch_end = min(batch_start + BATCH_SIZE, my_tile_count);
-            uint batch_count = batch_end - batch_start;
-
-            // Cooperative load: each thread loads one 32 B ProjectedComposite
-            // from a single SSBO (binding 6).  inv_basis is inlined, so one
-            // L2 fetch covers all data needed by the per-pixel Gaussian eval.
-            if (local_index < batch_count) {
-                uint entry_idx = my_tile_offset + batch_start + local_index;
-                uint splat_idx = sorted_splat_indices[entry_idx];
-                ProjectedComposite g = composite[splat_idx];
-                s_center[local_index] = unpackHalf2x16(g.center_xy_fp16);
-                s_depth[local_index] = g.depth;
-                s_alpha[local_index] = g.alpha;
-                s_color[local_index] = g.packed_rgba8;
-                s_inv_basis[local_index] = g.inv_basis;
+        // Keep only the nearest eight unprocessed hits per scan, not a cap on
+        // contributing surfels. Repeat until exhausted or opacity saturates.
+        // The (depth, splat ID) cursor gives deterministic ties and progress.
+        const uint HIT_BATCH = 8u;
+        // First select solid coverage. Only pixels below that threshold need
+        // a second traversal: preserve their faint support instead of forcing
+        // it opaque or deleting it. Ordinary transparency keeps its exact order.
+        for (uint surface_pass = 0u; surface_pass < 2u; ++surface_pass) {
+            if (surface_pass == 1u) {
+                pixel_active = !opaque_anchor_found && coverage_transmittance < 1.0;
+                if (pixel_active) {
+                    accum_color = vec3(0.0);
+                    transmittance = 1.0;
+                    out_norm_depth = 1.0;
+                    depth_written = false;
+                }
+                if (local_index == 0u) wg_active_count = 0u;
+                barrier();
+                uint weak_lanes = subgroupAdd(pixel_active ? 1u : 0u);
+                if (subgroupElect() && weak_lanes > 0u) {
+                    atomicAdd(wg_active_count, weak_lanes);
+                }
+                barrier();
+                if (wg_active_count == 0u) break;
             }
-            barrier();
+            float last_depth = -1.0;
+            uint last_id = 0u;
+            while (true) {
+                float hit_depth[HIT_BATCH];
+                float hit_alpha[HIT_BATCH];
+                uint hit_index[HIT_BATCH];
+                uint kept = 0u;
+                // Scan every tile candidate before blending any hit. Inactive
+                // pixels skip intersection work but still load and synchronize;
+                // all lanes traverse the same batches and continuation rounds.
+                for (uint batch_start = 0u; batch_start < my_tile_count;
+                     batch_start += BATCH_SIZE) {
+                    uint batch_end = min(batch_start + BATCH_SIZE, my_tile_count);
+                    uint batch_count = batch_end - batch_start;
 
-            // Per-pixel evaluation from shared memory.
-            // Skip if this pixel is outside the viewport or already saturated.
-            bool was_active = pixel_active;
-            if (pixel_active) {
-                for (uint i = 0u; i < batch_count; ++i) {
-                    // Discard splats at or behind scene geometry. Depth is
-                    // normalized linear (near=0, far=1): larger = farther.
-                    if (use_scene_depth && s_depth[i] >= scene_linear_01) {
-                        continue;
+                    // Cooperative load: each thread loads one 104 B ProjectedComposite
+                    // from a single SSBO (binding 6).
+                    if (local_index < batch_count) {
+                        LoadCandidate(my_tile_offset + batch_start, local_index);
                     }
+                    barrier();
 
-                    vec2 delta_pixels = pixel_center - s_center[i];
-                    vec2 gaussian_uv =
-                            vec2(dot(s_inv_basis[i].xy, delta_pixels),
-                                 dot(s_inv_basis[i].zw, delta_pixels));
-                    float power = -dot(gaussian_uv, gaussian_uv);
-                    if (power < -4.0) {
-                        continue;
+                    // Per-pixel evaluation from shared memory.
+                    // Skip if this pixel is outside the viewport or already saturated.
+                    if (pixel_active) {
+                        for (uint i = 0u; i < batch_count; ++i) {
+                            float linear_depth, alpha;
+                            if (!EvaluateCandidate(i, pixel_center, use_scene_depth,
+                                                   scene_linear_01, near, far,
+                                                   linear_depth, alpha)) continue;
+                            uint hit_id = s_index[i];
+                            if (linear_depth < last_depth ||
+                                (linear_depth == last_depth && hit_id <= last_id)) {
+                                continue;
+                            }
+                            uint at = kept;
+                            for (uint j = 0u; j < kept; ++j) {
+                                if (linear_depth < hit_depth[j] ||
+                                    (linear_depth == hit_depth[j] && hit_id < hit_index[j])) {
+                                    at = j;
+                                    break;
+                                }
+                            }
+                            if (at < HIT_BATCH) {
+                                uint stop = min(kept, HIT_BATCH - 1u);
+                                for (uint j = stop; j > at; --j) {
+                                    hit_depth[j] = hit_depth[j - 1u];
+                                    hit_alpha[j] = hit_alpha[j - 1u];
+                                    hit_index[j] = hit_index[j - 1u];
+                                }
+                                hit_depth[at] = linear_depth;
+                                hit_alpha[at] = alpha;
+                                hit_index[at] = hit_id;
+                                kept = min(kept + 1u, HIT_BATCH);
+                            }
+                        }
                     }
-                    float alpha = exp2(power * kLog2E) * s_alpha[i];
-                    if (alpha < kMinAlpha) {
-                        continue;
+                    barrier();
+                }  // scan every tile entry before compositing any selected hit
+                vec3 weak_normal[HIT_BATCH];
+                vec3 weak_color[HIT_BATCH];
+                float weak_weight[HIT_BATCH];
+                if (surface_pass == 1u) {
+                    for (uint j = 0u; j < HIT_BATCH; ++j) {
+                        weak_normal[j] = vec3(0.0);
+                        weak_color[j] = vec3(0.0);
+                        weak_weight[j] = 0.0;
                     }
-                    float contribution = transmittance * alpha;
-                    accum_color +=
-                            contribution * unpackUnorm4x8(s_color[i]).rgb;
-                    transmittance *= (1.0 - alpha);
-                    if (!depth_written && transmittance < kSurfaceThreshold) {
-                        out_norm_depth = s_depth[i];
-                        depth_written = true;
-                    }
-                    if (transmittance <= kMinTransmittance) {
-                        transmittance = 0.0;
-                        pixel_active = false;  // saturated
-                        break;
+                    // A single cooperative scan reconstructs all selected hits.
+                    // Only subthreshold pixels pay for this exact-depth replay.
+                    for (uint start = 0u; start < my_tile_count; start += BATCH_SIZE) {
+                        uint count = min(BATCH_SIZE, my_tile_count - start);
+                        if (local_index < count) {
+                            LoadCandidate(my_tile_offset + start, local_index);
+                        }
+                        barrier();
+                        if (pixel_active) {
+                            for (uint i = 0u; i < count; ++i) {
+                                if ((s_flags[i] & 1u) == 0u) continue;
+                                float depth, weight;
+                                if (!EvaluateCandidate(i, pixel_center, use_scene_depth,
+                                                       scene_linear_01, near, far,
+                                                       depth, weight)) continue;
+                                ProjectedComposite candidate = composite[s_index[i]];
+                                for (uint j = 0u; j < kept; ++j) {
+                                    ProjectedComposite anchor = composite[hit_index[j]];
+                                    if ((anchor.surface_flags & 1u) == 0u) continue;
+                                    AccumulateSurface(anchor, hit_depth[j], candidate,
+                                                      depth, weight, ray,
+                                                      weak_normal[j], weak_color[j],
+                                                      weak_weight[j]);
+                                }
+                            }
+                        }
+                        barrier();
                     }
                 }
+                if (pixel_active) {
+                    for (uint j = 0u; j < kept; ++j) {
+                        if (surface_pass == 0u &&
+                            (composite[hit_index[j]].surface_flags & 1u) != 0u) {
+                            // Reference coverage is geometric Gaussian support,
+                            // with fixed reference opacity shared by all splats.
+                            float reference_alpha = clamp(0.99 * hit_alpha[j], 0.0, 0.99);
+                            coverage_transmittance *= 1.0 - reference_alpha;
+                            if (coverage_transmittance < 0.5) {
+                                opaque_anchor_found = true;
+                                opaque_anchor_index = hit_index[j];
+                                opaque_anchor_depth = hit_depth[j];
+                                // Foreground transparency may already have
+                                // crossed the existing depth threshold. Keep
+                                // that nearer hit; shading never moves depth.
+                                if (!depth_written) {
+                                    out_norm_depth = (hit_depth[j] - near) / (far - near);
+                                    depth_written = true;
+                                }
+                                pixel_active = false;
+                                break;
+                            }
+                            last_depth = hit_depth[j];
+                            last_id = hit_index[j];
+                            continue;
+                        }
+                        float alpha = hit_alpha[j];
+                        ProjectedComposite hit = composite[hit_index[j]];
+                        vec3 shaded;
+                        if (surface_pass == 1u &&
+                            (hit.surface_flags & 1u) != 0u) {
+                            alpha = clamp(0.99 * hit_alpha[j], 0.0, 0.99);
+                            shaded = ShadeSurface(weak_normal[j], weak_color[j],
+                                                  weak_weight[j], ray);
+                        } else {
+                            shaded = ShadeSurface(
+                                    vec3(hit.surface_normal_xy,
+                                         hit.surface_normal_z_sigma.x),
+                                    vec3(hit.surface_color_rg,
+                                         hit.surface_color_b_reserved.x),
+                                    1.0, ray);
+                        }
+                        float contribution = transmittance * alpha;
+                        accum_color += contribution * shaded;
+                        transmittance *= (1.0 - alpha);
+                        if (!depth_written && transmittance < kSurfaceThreshold) {
+                            out_norm_depth = (hit_depth[j] - near) / (far - near);
+                            depth_written = true;
+                        }
+                        last_depth = hit_depth[j];
+                        last_id = hit_index[j];
+                        if (transmittance <= kMinTransmittance) {
+                            transmittance = 0.0;
+                            pixel_active = false;
+                            break;
+                        }
+                    }
+                    // Fewer than eight means this scan found every remaining hit.
+                    // A full batch continues from its final (depth, ID) next round.
+                    if (kept < HIT_BATCH) pixel_active = false;
+                }
+                // All invocations reach both barriers, including inactive pixels.
+                if (local_index == 0u) wg_active_count = 0u;
+                barrier();
+                uint lanes_active = subgroupAdd(pixel_active ? 1u : 0u);
+                if (subgroupElect() && lanes_active > 0u) {
+                    atomicAdd(wg_active_count, lanes_active);
+                }
+                barrier();
+                if (wg_active_count == 0u) break;
             }
-            // Workgroup early-exit: aggregate newly saturated lanes per
-            // subgroup so only one lane performs the shared-memory atomic.
-            // The barrier after the atomic is still required so every
-            // invocation observes the final count before the break test.
-            uint newly_saturated = (was_active && !pixel_active) ? 1u : 0u;
-            uint subgroup_saturated = subgroupAdd(newly_saturated);
-            if (subgroupElect() && subgroup_saturated > 0u) {
-                atomicAdd(wg_active_count, uint(0u - subgroup_saturated));
+        }
+
+        // Reconstruct the coverage-selected surface without interpolation-
+        // weight termination or a contributor cap. Coverage chooses identity;
+        // normalized weights shade only that identity. Keep actual selected
+        // hit depth, never averaged depth or a GS-center approximation.
+        bool gather_any = false;
+        if (local_index == 0u) wg_active_count = 0u;
+        barrier();
+        uint anchor_lanes = subgroupAdd(opaque_anchor_found ? 1u : 0u);
+        if (subgroupElect() && anchor_lanes > 0u) {
+            atomicAdd(wg_active_count, anchor_lanes);
+        }
+        barrier();
+        gather_any = wg_active_count > 0u;
+        if (gather_any) {
+            ProjectedComposite anchor = composite[opaque_anchor_index];
+            vec3 normal_sum = vec3(0.0);
+            vec3 color_sum = vec3(0.0);
+            float weight_sum = 0.0;
+            for (uint start = 0u; start < my_tile_count; start += BATCH_SIZE) {
+                uint count = min(BATCH_SIZE, my_tile_count - start);
+                if (local_index < count) {
+                    LoadCandidate(my_tile_offset + start, local_index);
+                }
+                barrier();
+                if (opaque_anchor_found) {
+                    for (uint i = 0u; i < count; ++i) {
+                        if ((s_flags[i] & 1u) == 0u) continue;
+                        ProjectedComposite candidate = composite[s_index[i]];
+                        float depth, weight;
+                        if (!EvaluateCandidate(i, pixel_center, use_scene_depth,
+                                               scene_linear_01, near, far,
+                                               depth, weight)) continue;
+                        AccumulateSurface(anchor, opaque_anchor_depth, candidate,
+                                          depth, weight, ray, normal_sum, color_sum,
+                                          weight_sum);
+                    }
+                }
+                barrier();
             }
-            barrier();
-            if (wg_active_count == 0u) break;
-        }  // batch loop
+            if (opaque_anchor_found && weight_sum > 0.0) {
+                vec3 shaded = ShadeSurface(normal_sum, color_sum,
+                                           weight_sum, ray);
+                accum_color += transmittance * shaded;
+                transmittance = 0.0;
+            }
+        }
 
         // Write outputs for pixels that are inside the viewport.
         if (pixel.x < viewport_size.x && pixel.y < viewport_size.y) {

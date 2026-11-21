@@ -111,6 +111,10 @@ public:
 
     bool IsValid() const { return initialized_; }
 
+    /// Changes whenever a new device is created; retained query resources
+    /// use this to reject stale handles after renderer teardown/recreation.
+    std::uint64_t GetGeneration() const { return generation_; }
+
     /// True when the selected device is a CPU/software Vulkan implementation.
     bool IsSoftwareDevice() const;
 
@@ -180,6 +184,7 @@ private:
 
     // --- State ------------------------------------------------------------
     bool initialized_ = false;
+    std::uint64_t generation_ = 0;
     bool debug_utils_enabled_ = false;
     std::string last_error_;
 

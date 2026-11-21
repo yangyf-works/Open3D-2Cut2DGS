@@ -8,6 +8,8 @@
 #include <rply.h>
 
 #include <cmath>
+#include <stdexcept>
+#include <unordered_set>
 #include <vector>
 
 #include "open3d/core/Dtype.h"
@@ -26,8 +28,6 @@ namespace io {
 namespace {
 constexpr auto ROTATION_SUFFIX_INDEX = std::char_traits<char>::length("rot_");
 constexpr auto SCALE_SUFFIX_INDEX = std::char_traits<char>::length("scale_");
-constexpr auto F_DC_SUFFIX_INDEX = std::char_traits<char>::length("f_dc_");
-constexpr auto F_REST_SUFFIX_INDEX = std::char_traits<char>::length("f_rest_");
 
 struct PLYReaderState {
     struct AttrState {
@@ -132,7 +132,7 @@ core::Dtype GetDtype(e_ply_type type) {
 
 // Map ply attributes to Open3D point cloud attributes
 std::tuple<std::string, int, int> GetNameStrideOffsetForAttribute(
-        const std::string& name) {
+        const std::string& name, bool gaussian_2d) {
     // Positions attribute.
     if (name == "x") return std::make_tuple("positions", 3, 0);
     if (name == "y") return std::make_tuple("positions", 3, 1);
@@ -148,20 +148,17 @@ std::tuple<std::string, int, int> GetNameStrideOffsetForAttribute(
     if (name == "green") return std::make_tuple("colors", 3, 1);
     if (name == "blue") return std::make_tuple("colors", 3, 2);
 
-    // 3DGS SH DC component.
-    if (name.rfind(std::string("f_dc") + "_", 0) == 0) {
-        int offset = std::stoi(name.substr(F_DC_SUFFIX_INDEX));
-        return std::make_tuple("f_dc", 3, offset);
+    // Header validation guarantees exactly three Float32 base-color lanes.
+    for (const std::string prefix : {"surface_color"}) {
+        if (name.rfind(prefix + "_", 0) == 0) {
+            return std::make_tuple(prefix, 3, name.back() - '0');
+        }
     }
-    // 3DGS SH higher order components. stride = 0 => set later
-    if (name.rfind(std::string("f_rest") + "_", 0) == 0) {
-        int offset = std::stoi(name.substr(F_REST_SUFFIX_INDEX));
-        return std::make_tuple("f_rest", 0, offset);
-    }
-    // 3DGS Gaussian scale attribute.
+    // Gaussian PLY stores one log isotropic tangent scale. Generic point clouds retain
+    // the existing three-component custom scale mapping.
     if (name.rfind(std::string("scale") + "_", 0) == 0) {
         int offset = std::stoi(name.substr(SCALE_SUFFIX_INDEX));
-        return std::make_tuple("scale", 3, offset);
+        return std::make_tuple("scale", gaussian_2d ? 1 : 3, offset);
     }
     // 3DGS Gaussian rotation as a quaternion.
     if (name.rfind(std::string("rot") + "_", 0) == 0) {
@@ -211,13 +208,90 @@ bool ReadPointCloudFromPLY(const std::string& filename,
         return false;
     }
 
+    // Validate the Gaussian scale schema before allocating callback targets.
+    // In particular, scale_1 must never become an out-of-bounds Nx1 write.
+    std::unordered_set<std::string> properties;
+    std::vector<std::pair<std::string, e_ply_type>> scale_properties;
+    std::vector<std::pair<std::string, e_ply_type>> appearance_properties;
+    for (auto property = ply_get_next_property(element, nullptr); property;
+         property = ply_get_next_property(element, property)) {
+        const char* name;
+        e_ply_type type;
+        ply_get_property_info(property, &name, &type, nullptr, nullptr);
+        properties.insert(name);
+        const std::string property_name(name);
+        for (const char* obsolete : {"f_dc", "f_rest", "surface_lighting"}) {
+            if (property_name == obsolete ||
+                property_name.rfind(std::string(obsolete) + "_", 0) == 0) {
+                ply_close(ply_file);
+                throw std::invalid_argument(
+                        std::string(obsolete) + " is no longer supported. Use "
+                        "surface_color and MaterialRecord.gaussian_splat_surface_lighting "
+                        "for Phong shading.");
+            }
+        }
+        for (const char* prefix : {"surface_color"}) {
+            if (property_name == prefix ||
+                property_name.rfind(std::string(prefix) + "_", 0) == 0) {
+                appearance_properties.emplace_back(name, type);
+            }
+        }
+        if (std::string(name).rfind("scale_", 0) == 0) {
+            scale_properties.emplace_back(name, type);
+        }
+    }
+    const bool gaussian_2d = properties.count("rot_0") &&
+                             (!scale_properties.empty() || properties.count("scale"));
+    if (gaussian_2d && properties.count("opacity")) {
+        ply_close(ply_file);
+        throw std::invalid_argument(
+                "Gaussian splat opacity is no longer supported. Remove the "
+                "opacity property; all Gaussian splats use fixed opacity "
+                "0.99.");
+    }
+    if (gaussian_2d &&
+        (properties.count("scale") || scale_properties.size() != 1 ||
+         !properties.count("scale_0") ||
+         GetDtype(scale_properties[0].second) == core::Undefined)) {
+        ply_close(ply_file);
+        utility::LogError(
+                "Gaussian PLY requires only numeric scale_0 (scale shape "
+                "(N, 1)). scale_1, scale_2 and other multi-axis "
+                "representations are not supported.");
+    }
+
+    // Validate grouped lanes before callbacks retain pointers into the tensors.
+    // Duplicate, missing, mixed-type and malformed names must never alias writes.
+    for (const std::string prefix : {"surface_color"}) {
+        std::unordered_set<std::string> seen;
+        bool valid = true;
+        size_t count = 0;
+        for (const auto& item : appearance_properties) {
+            if (item.first != prefix && item.first.rfind(prefix + "_", 0) != 0) {
+                continue;
+            }
+            ++count;
+            valid = valid && GetDtype(item.second) == core::Float32 &&
+                    (item.first == prefix + "_0" ||
+                     item.first == prefix + "_1" ||
+                     item.first == prefix + "_2") &&
+                    seen.insert(item.first).second;
+        }
+        if ((gaussian_2d || count > 0) && (!valid || count != 3)) {
+            ply_close(ply_file);
+            throw std::invalid_argument(
+                    "Gaussian PLY " + prefix +
+                    " requires exactly Float32 properties " + prefix +
+                    "_0, " + prefix + "_1 and " + prefix + "_2.");
+        }
+    }
+
     std::unordered_map<std::string, bool> primary_attr_init = {
             {"positions", false}, {"normals", false}, {"colors", false},
             {"opacity", false},   {"rot", false},     {"scale", false},
-            {"f_dc", false},      {"f_rest", false},
+            {"surface_color", false},
     };
 
-    int f_rest_count = 0;
     p_ply_property attribute = ply_get_next_property(element, nullptr);
 
     while (attribute) {
@@ -248,10 +322,7 @@ bool ReadPointCloudFromPLY(const std::string& filename,
 
             const std::string attr_name = std::string(name);
             auto [name, stride, offset] =
-                    GetNameStrideOffsetForAttribute(attr_name);
-            if (name == "f_rest") {
-                f_rest_count++;
-            }
+                    GetNameStrideOffsetForAttribute(attr_name, gaussian_2d);
             attr_state->name_ = name;
             attr_state->stride_ = stride;
             attr_state->offset_ = offset;
@@ -276,36 +347,6 @@ bool ReadPointCloudFromPLY(const std::string& filename,
         attribute = ply_get_next_property(element, attribute);
     }
 
-    if (f_rest_count > 0) {
-        if (f_rest_count % 3 != 0) {
-            utility::LogWarning(
-                    "Read PLY failed: 3DGS f_rest attribute has {} elements "
-                    "per point, which is not divisible by 3.",
-                    f_rest_count);
-            ply_close(ply_file);
-            return false;
-        }
-        core::Tensor new_f_rest =
-                core::Tensor::Empty({element_size, f_rest_count / 3, 3},
-                                    core::Float32, pointcloud.GetDevice());
-        pointcloud.SetPointAttr("f_rest", new_f_rest);
-        for (auto& attr_state : state.id_to_attr_state_) {
-            if (attr_state->name_ == "f_rest") {
-                attr_state->data_ptr_ =
-                        pointcloud.GetPointAttr("f_rest").GetDataPtr();
-                // GraphDECO / 3DGS PLY stores f_rest properties channel-major:
-                //   R[0..Nc), G[0..Nc), B[0..Nc).
-                // Open3D stores f_rest as {N, Nc, 3}, i.e. basis-major RGB
-                // triples. Remap each property offset into the tensor layout.
-                const int basis_count = f_rest_count / 3;
-                const int channel = attr_state->offset_ / basis_count;
-                const int basis = attr_state->offset_ % basis_count;
-                attr_state->stride_ = f_rest_count;
-                attr_state->offset_ = basis * 3 + channel;
-            }
-        }
-    }
-
     utility::CountingProgressReporter reporter(params.update_progress);
     reporter.SetTotal(element_size);
     state.progress_bar_ = &reporter;
@@ -320,7 +361,7 @@ bool ReadPointCloudFromPLY(const std::string& filename,
     ply_close(ply_file);
     reporter.Finish();
 
-    if (pointcloud.IsGaussianSplat()) {  // validates 3DGS, if present.
+    if (pointcloud.IsGaussianSplat()) {  // validates 2DGS, if present.
         utility::LogDebug("PLY file contains a Gaussian Splat.");
         // PLY files store scales in log-space; convert to linear so the
         // canonical representation in PointCloud is always linear.
@@ -334,6 +375,7 @@ bool ReadPointCloudFromPLY(const std::string& filename,
             }
             pointcloud.SetPointAttr("scale", scale_f32);
         }
+        pointcloud = pointcloud.NormalizeGaussianSplatClipping();
     }
 
     return true;
@@ -363,38 +405,38 @@ e_ply_type GetPlyType(const core::Dtype& dtype) {
 struct AttributePtr {
     AttributePtr(const core::Dtype& dtype,
                  const void* data_ptr,
-                 const int& group_size,
-                 const std::vector<int>& write_order = {})
+                 const int& group_size)
         : dtype_(dtype),
           data_ptr_(data_ptr),
-          group_size_(group_size),
-          write_order_(write_order) {}
+          group_size_(group_size) {}
 
     const core::Dtype dtype_;
     const void* data_ptr_;
     const int group_size_;
-    // Optional per-element index permutation for channel-reordering.
-    // Empty means write elements in storage order (default).
-    const std::vector<int> write_order_;
 };
 }  // namespace
 
 bool WritePointCloudToPLY(const std::string& filename,
                           const geometry::PointCloud& pointcloud,
                           const open3d::io::WritePointCloudOption& params) {
+    // Validate the Gaussian schema even when N is zero, before opening a file.
+    if (pointcloud.IsGaussianSplat()) {
+        utility::LogDebug("Writing Gaussian Splat point cloud to PLY file.");
+    }
     if (pointcloud.IsEmpty()) {
         utility::LogWarning("Write PLY failed: point cloud has 0 points.");
         return false;
     }
 
-    if (pointcloud.IsGaussianSplat()) {  // validates 3DGS, if present.
-        utility::LogDebug("Writing Gaussian Splat point cloud to PLY file.");
+    // PLY already requires CPU storage. Validate clipping on this copy before
+    // serializing; obsolete attributes are rejected instead of converted.
+    auto cpu_cloud = pointcloud.To(core::Device("CPU:0"));
+    if (cpu_cloud.IsGaussianSplat()) {
+        cpu_cloud = cpu_cloud.NormalizeGaussianSplatClipping();
     }
+    geometry::TensorMap t_map = cpu_cloud.GetPointAttr().Contiguous();
 
-    geometry::TensorMap t_map =
-            pointcloud.To(core::Device("CPU:0")).GetPointAttr().Contiguous();
-
-    // PLY files store 3DGS scales in log-space. Convert the canonical linear
+    // PLY files store the isotropic tangent scale in log-space. Convert linear
     // "scale" attribute to log before writing, then restore after.
     core::Tensor scale_log_copy;
     if (pointcloud.IsGaussianSplat() && t_map.Contains("scale")) {
@@ -494,7 +536,7 @@ bool WritePointCloudToPLY(const std::string& filename,
     // Extra attributes are expected to be tensors with shape (num_points,
     // channels) or (num_points, C, D). For multi-channel attributes, the
     // channels are flattened, and each channel is written as a separate
-    // property (e.g., "f_rest_0", "f_rest_1", ...).
+    // property (e.g., "surface_color_0", "surface_color_1", ...).
     e_ply_type attributeType;
     for (auto const& it : t_map) {
         if (it.first == "positions" || it.first == "colors" ||
@@ -511,40 +553,14 @@ bool WritePointCloudToPLY(const std::string& filename,
             attribute_ptrs.emplace_back(it.second.GetDtype(),
                                         it.second.GetDataPtr(), 1);
             attributeType = GetPlyType(it.second.GetDtype());
-            ply_add_property(ply_file, it.first.c_str(), attributeType,
+            // Gaussian scalar scale retains the canonical scale_0 disk name;
+            // ordinary point-cloud scalar attributes keep their own names.
+            const char* property_name =
+                    it.first == "scale" && pointcloud.IsGaussianSplat()
+                            ? "scale_0"
+                            : it.first.c_str();
+            ply_add_property(ply_file, property_name, attributeType,
                              attributeType, attributeType);
-        } else if (it.first == "f_rest" && shape.size() == 3 && shape[2] == 3) {
-            // f_rest shape is {N, basis_count, 3}.
-            // The PLY reader expects channel-major (GraphDECO) ordering:
-            //   f_rest_0 .. f_rest_{Nc-1}  : R basis coefficients
-            //   f_rest_Nc .. f_rest_{2Nc-1}: G basis coefficients
-            //   f_rest_{2Nc} .. f_rest_{3Nc-1}: B basis coefficients
-            // The tensor is stored basis-major: element[basis*3 + channel].
-            // We emit the property names in channel-major order and build a
-            // write_order permutation so values are written in the same order.
-            const int basis_count = static_cast<int>(shape[1]);
-            attributeType = GetPlyType(it.second.GetDtype());
-            for (int channel = 0; channel < 3; ++channel) {
-                for (int basis = 0; basis < basis_count; ++basis) {
-                    int prop_idx = channel * basis_count + basis;
-                    std::string prop_name =
-                            "f_rest_" + std::to_string(prop_idx);
-                    ply_add_property(ply_file, prop_name.c_str(), attributeType,
-                                     attributeType, attributeType);
-                }
-            }
-            // Build permutation: for each output slot (channel-major index)
-            // record the corresponding storage index (basis-major).
-            std::vector<int> write_order;
-            write_order.reserve(group_size);
-            for (int channel = 0; channel < 3; ++channel) {
-                for (int basis = 0; basis < basis_count; ++basis) {
-                    write_order.push_back(basis * 3 + channel);
-                }
-            }
-            attribute_ptrs.emplace_back(it.second.GetDtype(),
-                                        it.second.GetDataPtr(), group_size,
-                                        write_order);
         } else {
             for (int ch = 0; ch < group_size; ch++) {
                 std::string prop_name = it.first + "_" + std::to_string(ch);
@@ -572,18 +588,8 @@ bool WritePointCloudToPLY(const std::string& filename,
                 const scalar_t* data_ptr =
                         static_cast<const scalar_t*>(it.data_ptr_);
                 const int base = it.group_size_ * static_cast<int>(i);
-                if (!it.write_order_.empty()) {
-                    // Channel-reordered write (e.g. f_rest channel-major).
-                    for (int idx : it.write_order_) {
-                        ply_write(ply_file, data_ptr[base + idx]);
-                    }
-                } else {
-                    for (int idx_offset = base;
-                         idx_offset <
-                         it.group_size_ * (static_cast<int>(i) + 1);
-                         ++idx_offset) {
-                        ply_write(ply_file, data_ptr[idx_offset]);
-                    }
+                for (int channel = 0; channel < it.group_size_; ++channel) {
+                    ply_write(ply_file, data_ptr[base + channel]);
                 }
             });
         }

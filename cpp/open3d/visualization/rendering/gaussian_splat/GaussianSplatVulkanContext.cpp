@@ -316,6 +316,7 @@ bool GaussianSplatVulkanContext::Initialize() {
     shared_context_.graphics_queue_family_index = graphics_queue_family_;
     shared_context_.graphics_queue_index = filament_queue_index_;
 
+    ++generation_;
     initialized_ = true;
     utility::LogDebug(
             "GaussianSplat VulkanContext: ready '{}' (fam={} gs_q=0 fil_q={})",

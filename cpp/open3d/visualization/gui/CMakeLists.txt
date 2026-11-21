@@ -77,6 +77,7 @@ set(GAUSSIAN_COMPUTE_SHADER_SOURCE_FILES
     ../rendering/gaussian_splat/shaders/gaussian_radix_sort_scatter.comp
     ../rendering/gaussian_splat/shaders/gaussian_compute_dispatch_args.comp
     ../rendering/gaussian_splat/shaders/gaussian_depth_merge.comp
+    ../rendering/gaussian_splat/shaders/gaussian_dexel.comp
 )
 
 # copy GUI/Resources -> <output>/resources
@@ -92,6 +93,8 @@ open3d_add_compute_shaders(gaussian_compute_shaders
     ${GUI_RESOURCE_DIR}/gaussian_splat
     SOURCES
     ${GAUSSIAN_COMPUTE_SHADER_SOURCE_FILES}
+    INCLUDE_FILES
+    ../rendering/gaussian_splat/shaders/gaussian_ray_intersection.glsl
 )
 
 

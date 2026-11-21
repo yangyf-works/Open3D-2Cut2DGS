@@ -84,8 +84,14 @@ bool HasGaussianSplatProperties(p_ply ply_file) {
                 return name.rfind("f_dc_", 0) == 0;
             }));
 
-    return has_required_properties && scale_count >= 3 && rot_count >= 4 &&
-           f_dc_count >= 3;
+    const bool shared_phong = vertex_property_names.count("x") &&
+                              vertex_property_names.count("y") &&
+                              vertex_property_names.count("z") &&
+                              vertex_property_names.count("scale_0") &&
+                              rot_count >= 4 &&
+                              vertex_property_names.count("surface_color_0");
+    return shared_phong || (has_required_properties && scale_count >= 3 &&
+                            rot_count >= 4 && f_dc_count >= 3);
 }
 
 namespace ply_pointcloud_reader {

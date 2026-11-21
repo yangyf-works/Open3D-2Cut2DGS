@@ -83,21 +83,35 @@ struct MaterialRecord {
     // Infinite ground plane
     float ground_plane_axis = 0.f;  // 0: XZ; >0: XY; <0: YZ
 
-    // Max Spherical Harmonic degree for rendering gaussian splats.
-    int gaussian_splat_sh_degree = 2;
-
-    // Minimum splat alpha value when rendering gaussian splats.
-    /// Minimum alpha threshold for Gaussian splat CPU-side filtering in
-    /// PackGaussianSplatAttrsDirect().  Splats whose sigmoid(opacity) is below
-    /// this value are discarded at load time and never uploaded to the GPU,
-    /// removing the need for a redundant per-splat GPU alpha test.
-    /// Matches the composite pass kMinAlpha = 1/255.
+    /// Minimum center alpha for transparent Gaussian objects. All GS use
+    /// fixed alpha 0.99: a threshold above 0.99 excludes the whole object.
+    /// Opaque surfaces ignore this threshold and use Gaussian-only weights.
+    /// The separate per-pixel contribution threshold remains 1/255.
     float gaussian_splat_min_alpha = 1.0f / 255.0f;
 
     // Enable anti-aliasing density compensation for gaussian splats.
     // Multiplies each splat's opacity by sqrt(det(Sigma) / det(Sigma_blurred))
     // to counteract the over-brightening caused by the fixed +0.3 blur kernel.
     bool gaussian_splat_antialias = false;
+
+    /// One ambient/diffuse/specular triple for every Gaussian in the scene.
+    /// Finite nonnegative values; all Gaussian objects must specify the same
+    /// triple. Default (1,0,0) preserves unlit RGB. No per-GS lighting attribute.
+    Eigen::Vector3f gaussian_splat_surface_lighting = Eigen::Vector3f(1.f, 0.f, 0.f);
+
+    /// Scene-wide specular exponent; finite and strictly positive. Default 2
+    /// preserves the original highlight. All Gaussian objects must agree;
+    /// remove/re-add them to change it, as with the lighting coefficients.
+    float gaussian_splat_surface_shininess = 2.f;
+
+    /// Reconstruct an opaque surface from Gaussian-weighted normals/albedo.
+    /// Both modes use Float32 surface_color (N,3) and the shared Phong
+    /// coefficients above; only this mode interpolates normals. Optional
+    /// Int32 surface_id (N,1): positive IDs share a surface within this object;
+    /// zero or missing IDs isolate individual samples. Above 50% reference
+    /// coverage, shade opaquely; below it, preserve partial Gaussian coverage.
+    /// Both sides retain original clipping and exact per-pixel depth.
+    bool gaussian_splat_opaque_surface = false;
 
     // Hard per-splat cap on the number of screen tiles a single splat may
     // cover; splats whose footprint would exceed this are culled (dropped)

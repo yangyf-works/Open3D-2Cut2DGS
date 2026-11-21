@@ -52,6 +52,8 @@ layout(std140, binding = 0) uniform GaussianViewParams {
     uvec4 tiles;
     uvec4 limits;
     vec4 depth_range_and_flags;
+    // One Phong triple for every GS; w is reserved and zero.
+    vec4 surface_lighting;
 }
 view_params;
 

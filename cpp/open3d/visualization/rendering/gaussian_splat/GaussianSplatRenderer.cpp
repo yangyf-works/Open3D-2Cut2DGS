@@ -375,11 +375,21 @@ GaussianSplatRenderer::GetRenderConfig() const {
 }
 
 void GaussianSplatRenderer::SetRenderConfig(const RenderConfig& config) {
-    // Validate and apply a new render config; invalidate all outputs so the
-    // next frame rebuilds with the new settings.
+    // Geometry changes are tracked separately by the scene change ID.
+    // Re-applying the same config must not invalidate a completed overlay.
     if (!ValidateRenderConfig(config)) {
         utility::LogWarning(
                 "Ignoring invalid GaussianSplat render configuration.");
+        return;
+    }
+
+    if (config.tile_size == render_config_.tile_size &&
+        config.projection_group_size == render_config_.projection_group_size &&
+        config.composite_group_size == render_config_.composite_group_size &&
+        config.max_tiles_per_splat == render_config_.max_tiles_per_splat &&
+        config.avg_tiles_per_splat == render_config_.avg_tiles_per_splat &&
+        config.max_tile_entries_total == render_config_.max_tile_entries_total &&
+        config.antialias == render_config_.antialias) {
         return;
     }
 
@@ -600,12 +610,10 @@ bool GaussianSplatRenderer::UpdateViewRenderData(OutputTargets& targets,
 bool GaussianSplatRenderer::ValidateRenderConfig(
         const RenderConfig& config) const {
     // Reject configs with zero or out-of-range values before applying.
-    static constexpr int kMaxSupportedShDegree = 2;
     return config.tile_size.x() > 0 && config.tile_size.y() > 0 &&
            config.projection_group_size > 0 &&
            config.composite_group_size.x() > 0 &&
-           config.composite_group_size.y() > 0 && config.max_sh_degree >= 0 &&
-           config.max_sh_degree <= kMaxSupportedShDegree &&
+           config.composite_group_size.y() > 0 &&
            config.max_tiles_per_splat > 0 && config.avg_tiles_per_splat > 0 &&
            config.max_tile_entries_total > 0;
 }

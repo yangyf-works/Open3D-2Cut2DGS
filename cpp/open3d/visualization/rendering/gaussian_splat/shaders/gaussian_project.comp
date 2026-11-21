@@ -8,10 +8,9 @@
 // Gaussian splat projection pass.
 //
 // Each invocation processes one splat:
-//   1. Transforms the 3D Gaussian to screen space, evaluating the 2D covariance
-//      and per-pixel Gaussian kernel (inv_basis) from the 3x3 model covariance.
-//   2. Evaluates the view-dependent SH color.
-//   3. Writes per-splat composite data (ProjectedComposite, 32 B, binding 6)
+//   1. Projects the 2D Gaussian tangent plane for per-pixel ray intersection.
+//   2. Transmits unlit RGB for shading with the common Phong coefficients.
+//   3. Writes per-splat composite data (ProjectedComposite, 104 B, binding 6)
 //      consumed only by gaussian_composite.comp.
 //   4. For each screen tile the splat overlaps, atomically claims a slot in the
 //      sort_keys/sort_values ping-pong buffers (bindings 7/8) and writes a
@@ -21,8 +20,8 @@
 //
 // Fusing entry generation here eliminates the old prefix_sum + scatter + keygen
 // + payload passes (~65 ms) and ~80 MB of intermediate GPU buffers.
-// Opt4b: ProjectedComposite (32 B, binding 6) packs all composite-pass data.
-// Opt8:  Early cull: behind-camera splats rejected before covariance/SH math.
+// Opt4b: ProjectedComposite (104 B, binding 6) packs all composite-pass data.
+// Opt8:  Early cull: behind-camera splats rejected before projection math.
 
 #version 460
 
@@ -33,15 +32,25 @@
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
-// Composite-pass output: fp16 center + fp32 depth/alpha + RGBA8 + vec4
-// inv_basis (32 B). Inlining inv_basis avoids a separate SSBO lookup in the
-// composite cooperative load — one 32 B fetch instead of two 16 B fetches.
+// Composite-pass surfel data, std430: alignment 8, stride 104 bytes.
+// Must match GaussianSplatDataPacking.h and gaussian_composite.comp.
 struct ProjectedComposite {
-    uint center_xy_fp16;  // packHalf2x16(center_x, center_y) viewport pixels
-    float depth;          // normalized linear depth (near=0, far=1)
-    float alpha;          // sigmoid(opacity) × density_compensation
-    uint packed_rgba8;    // RGBA8 view-dependent color
-    vec4 inv_basis;  // 2×2 inverse covariance basis (row-major), 16 B align
+    // vec2 pairs retain FP32 projective/depth rows without vec4 padding.
+    vec2 row_x_xy;
+    vec2 row_x_zw;
+    vec2 row_y_xy;
+    vec2 row_y_zw;
+    vec2 row_w_xy;
+    vec2 row_w_zw;
+    // Float32 clips; inactive angle = 4, split = 0.
+    vec2 clip1_angle_split;
+    vec2 clip2_angle_split;
+    uint surface_id;
+    uint surface_flags;
+    vec2 surface_normal_xy;
+    vec2 surface_normal_z_sigma;
+    vec2 surface_color_rg;
+    vec2 surface_color_b_reserved;
 };
 
 layout(std140, binding = 0) uniform GaussianViewParams {
@@ -54,36 +63,29 @@ layout(std140, binding = 0) uniform GaussianViewParams {
     uvec4 tiles;
     uvec4 limits;
     vec4 depth_range_and_flags;
+    // One Phong triple for every GS; w is reserved and zero.
+    vec4 surface_lighting;
 }
 view_params;
 
+// XYZ position and isotropic tangent scale share one Float32 vec4.
 layout(std430, binding = 1) restrict readonly buffer GaussianPositions {
     vec4 positions[];
 };
 
-// fp16×4 packed as uvec2: .x = packHalf2x16(sx, sy), .y = packHalf2x16(sz, 0)
-// Values are linear scales (not log); clamped to [1e-9, 5e8] in the shader.
-layout(std430, binding = 2) restrict readonly buffer GaussianScales {
-    uvec2 scales[];
-};
-
-// snorm8-biased×4 in one uint: bytes 0-3 = (w, x, y, z) of quaternion;
-// stored byte = int8(round(q * 127)) + 128.  GPU decode: (byte - 128) / 127.
+// Float32 quaternion (w,x,y,z), sixteen bytes per splat.
 layout(std430, binding = 3) restrict readonly buffer GaussianRotations {
-    uint rotations[];
+    vec4 rotations[];
 };
 
-// fp16×4 packed as uvec2: .x = packHalf2x16(r, g), .y = packHalf2x16(b,
-// sigmoid(opacity_logit)) — sigmoid is applied on CPU at pack time.
-layout(std430, binding = 4) restrict readonly buffer GaussianDcOpacity {
-    uvec2 dc_opacity[];
+// Nine words: Float32 clips (0..3), identity/flags (4/5), RGB (6..8).
+// Phong coefficients are shared by every GS in GaussianViewParams.
+layout(std430, binding = 4) restrict readonly buffer GaussianSurfaceData {
+    uint surface_data[];
 };
 
-// fp16 uvec2 per entry; stride = GetShDegree() * 3 uvec2 per splat (0, 3, or
-// 6). Each uvec2 = 4 fp16 values, replacing the former fp32 vec4 one-to-one.
-layout(std430, binding = 5) restrict readonly buffer GaussianShCoefficients {
-    uvec2 sh_coeffs[];
-};
+// Must match kGaussianSplatSurfaceWords in GaussianSplatDataPacking.h.
+const uint kSurfaceWords = 9u;
 
 layout(std430, binding = 6) restrict writeonly buffer ProjectedComposites {
     ProjectedComposite composite[];
@@ -120,17 +122,14 @@ const float kMinDeterminant = 1e-8;
 const float kMinEigenValue = 1e-6;
 const float kMinAlpha = 1.0 / 255.0;
 const uint kGsErrorTileEntryOverflow = 1u << 0;
+const float kSurfelCutoff = 3.0;
+const float kFilterSize = 0.70710678118;  // sqrt(2) / 2
+const float kProjectionEpsilon = 1e-8;
 // Set when a splat's tile footprint exceeds RenderConfig::max_tiles_per_splat
 // and the splat is culled (dropped entirely) rather than rendered cropped.
 const uint kGsErrorMaxTilesPerSplatExceeded = 1u << 2;
 
 uint GetSplatCount() { return view_params.scene.x; }
-
-uint GetShDegree() {
-    // view_params.scene.y already stores min(config.max_sh_degree,
-    // actual_degree) on the CPU; clamp again to the shader-supported maximum.
-    return min(view_params.scene.y, 2u);
-}
 
 // Returns true when density-compensation anti-aliasing is enabled.
 bool GetAntialias() { return view_params.scene.z != 0u; }
@@ -144,12 +143,6 @@ uvec2 GetTileCount() { return max(view_params.tiles.zw, uvec2(1u)); }
 
 vec2 GetViewportSize() {
     return max(view_params.viewport_origin_and_size.zw, vec2(1.0));
-}
-
-// Pack RGB color to RGBA8 uint with full alpha using the built-in
-// packUnorm4x8, which maps to a single GPU instruction.
-uint PackColorRGBA8(vec3 color) {
-    return packUnorm4x8(vec4(clamp(color, 0.0, 1.0), 1.0));
 }
 
 uint PackTileCoord(uvec2 tile) { return (tile.y << 16u) | tile.x; }
@@ -170,89 +163,20 @@ mat3 QuaternionToRotation(vec4 q) {
                 off.z + wt.z, off.y + wt.y, off.z - wt.z, diag.z);
 }
 
-// Decode fp16 uvec2 pair to vec3 (linear scales buffer).
+// Expand one Float32 scale to both tangent axes without quantization.
 vec3 LoadLinearScale(uint i) {
-    uvec2 p = scales[i];
-    return vec3(unpackHalf2x16(p.x), unpackHalf2x16(p.y).x);
+    return vec3(vec2(positions[i].w), 0.0);
 }
 
-// Decode biased snorm8×4 quaternion (w,x,y,z) from one uint32.
-// Stored as int8(round(q*127))+128; GPU decode: (byte - 128) / 127.
-// normalize() absorbs the ~0.8° quantization error inherent in int8.
+// Retain Float32 precision and normalize before constructing the frame.
 vec4 LoadRotation(uint i) {
-    uvec4 b = (uvec4(rotations[i]) >> uvec4(0u, 8u, 16u, 24u)) & 0xFFu;
-    return normalize((vec4(b) - 128.0) * (1.0 / 127.0));
+    return normalize(rotations[i]);
 }
 
-// Decode fp16 uvec2 pair to vec4 (dc_opacity buffer).
-vec4 LoadDcOpacity(uint i) {
-    uvec2 p = dc_opacity[i];
-    return vec4(unpackHalf2x16(p.x), unpackHalf2x16(p.y));
-}
-
-// Load one logical vec4 worth of SH coefficients as fp16.
-// Stride = GetShDegree() * 3 uvec2/splat; each uvec2 encodes 4 fp16 values,
-// keeping the same local_vec4_index interface as before.
-vec4 LoadShVec4(uint splat_index, uint local_vec4_index) {
-    uint stride = GetShDegree() * 3u;
-    uvec2 p = sh_coeffs[splat_index * stride + local_vec4_index];
-    return vec4(unpackHalf2x16(p.x), unpackHalf2x16(p.y));
-}
-
-// buffer3 (index 2) is shared between degree-1 and degree-2 evaluation to
-// avoid loading the same vec4 twice when both degrees are active.
-vec3 EvaluateShDegree1(vec3 dir, uint splat_index, vec4 buffer3) {
-    vec4 b1 = LoadShVec4(splat_index, 0u);
-    vec4 b2 = LoadShVec4(splat_index, 1u);
-    // f_rest is packed as basis-major RGB triples:
-    // (Y-1.r, Y-1.g, Y-1.b, Y0.r | Y0.g, Y0.b, Y+1.r, Y+1.g |
-    // Y+1.b)
-    vec3 yn1 = vec3(b1.x, b1.y, b1.z);       // m=-1, scaled by dir.y
-    vec3 y0 = vec3(b1.w, b2.x, b2.y);        // m= 0, scaled by dir.z
-    vec3 yp1 = vec3(b2.z, b2.w, buffer3.x);  // m=+1, scaled by dir.x
-    const float c1 = 0.4886025119;
-    return c1 * (-yn1 * dir.y + y0 * dir.z - yp1 * dir.x);
-}
-
-vec3 EvaluateShDegree2(vec3 dir, uint splat_index, vec4 buffer3) {
-    vec4 b4 = LoadShVec4(splat_index, 3u);
-    vec4 b5 = LoadShVec4(splat_index, 4u);
-    vec4 b6 = LoadShVec4(splat_index, 5u);
-
-    const vec3 c012 = vec3(1.0925484306, -1.0925484306, 0.3153915653);
-    const vec2 c34 = vec2(-1.0925484306, 0.5462742153);
-    float x = dir.x, y = dir.y, z = dir.z;
-    vec3 basis0 = c012 * vec3(x * y, y * z, 3.0 * z * z - 1.0);
-    vec2 basis1 = c34 * vec2(x * z, x * x - y * y);
-
-    // Continue the same basis-major RGB order for degree 2:
-    // (Y-2.rgb, Y-1.rgb, Y0.rgb, Y+1.rgb, Y+2.rgb)
-    vec3 cm2 = vec3(buffer3.y, buffer3.z, buffer3.w);  // m=-2
-    vec3 cm1 = vec3(b4.x, b4.y, b4.z);                 // m=-1
-    vec3 c0 = vec3(b4.w, b5.x, b5.y);                  // m= 0
-    vec3 cp1 = vec3(b5.z, b5.w, b6.x);                 // m=+1
-    vec3 cp2 = vec3(b6.y, b6.z, b6.w);                 // m=+2
-
-    return cm2 * basis0.x + cm1 * basis0.y + c0 * basis0.z + cp1 * basis1.x +
-           cp2 * basis1.y;
-}
-
-// dc is passed in from the caller to avoid a duplicate LoadDcOpacity() call.
-// buffer3 (index 2) is loaded once and shared between degree-1 and degree-2.
-vec3 EvaluateShColor(uint splat_index, vec3 view_dir, vec4 dc) {
-    const float sh0 = 0.2820947918;
-    vec3 color = vec3(0.5) + sh0 * dc.xyz;
-
-    uint sh_degree = GetShDegree();
-    if (sh_degree >= 1u) {
-        vec4 buffer3 = LoadShVec4(splat_index, 2u);
-        color += EvaluateShDegree1(view_dir, splat_index, buffer3);
-        if (sh_degree >= 2u) {
-            color += EvaluateShDegree2(view_dir, splat_index, buffer3);
-        }
-    }
-
-    return max(color, vec3(0.0));
+// Reinterpret two unchanged Float32 bit patterns for each clipping edge.
+vec2 LoadClipAngleSplit(uint i, uint edge) {
+    uint base = i * kSurfaceWords + 2u * edge;
+    return uintBitsToFloat(uvec2(surface_data[base], surface_data[base + 1u]));
 }
 
 // Per-splat data returned by ProjectGaussian and consumed by WriteSortEntries.
@@ -271,7 +195,41 @@ struct SortEntryParams {
 SortEntryParams CulledEntryParams(uint idx) {
     return SortEntryParams(uvec2(0u), uvec2(0u), 0u, idx, 0u);
 }
+bool ComputeSurfelAabb(vec3 row_x,
+                       vec3 row_y,
+                       vec3 row_w,
+                       float cutoff,
+                       out vec2 center_pixel,
+                       out vec2 half_extent) {
+    float cutoff_sq = cutoff * cutoff;
+    vec3 conic = vec3(cutoff_sq, cutoff_sq, -1.0);
 
+    float denominator = dot(conic, row_w * row_w);
+
+    // denominator >= 0 means that the cutoff disk reaches/crosses
+    // the projective horizon and has no finite screen-space AABB.
+    if (!(denominator < -kProjectionEpsilon)) {
+        return false;
+    }
+
+    vec3 f = conic / denominator;
+
+    center_pixel = vec2(dot(f, row_x * row_w),
+                        dot(f, row_y * row_w));
+
+    vec2 extent_sq =
+            center_pixel * center_pixel -
+            vec2(dot(f, row_x * row_x),
+                 dot(f, row_y * row_y));
+
+    if (any(isnan(center_pixel)) || any(isinf(center_pixel)) ||
+        any(isnan(extent_sq)) || any(isinf(extent_sq))) {
+        return false;
+    }
+
+    half_extent = sqrt(max(extent_sq, vec2(1e-4)));
+    return true;
+}
 SortEntryParams ProjectGaussian(uint splat_index) {
     // Bit-packed visibility mask: extract bit (splat_index % 32) from word
     // (splat_index / 32). 0 = hidden by ShowGeometry(); no sort entries are
@@ -290,119 +248,70 @@ SortEntryParams ProjectGaussian(uint splat_index) {
     vec4 clip_center = view_params.clip_from_view * view_center;
 
     // Early reject: behind camera or outside [near, far].
-    // Sub-threshold alpha splats are already filtered CPU-side by
-    // PackGaussianSplatAttrsDirect() (MaterialRecord.gaussian_splat_min_alpha
-    // = 1/255 by default), so no redundant GPU alpha test is needed here.
-    // dc is loaded once and reused in EvaluateShColor() to avoid a second
-    // LoadDcOpacity() call.
     float near = view_params.depth_range_and_flags.x;
     float far = view_params.depth_range_and_flags.y;
-    vec4 dc = LoadDcOpacity(splat_index);
-    float alpha = dc.w;  // sigmoid applied on CPU during buffer packing
     if (clip_center.w <= 0.0 || view_center.z >= -near ||
         view_center.z <= -far) {
         return CulledEntryParams(splat_index);
     }
 
-    // Scale values are linear (exp already applied at load time).
-    // Clamp to [1e-9, 5e8] — equivalent bounds to the old exp([-20, 20]).
-    vec3 scale = clamp(LoadLinearScale(splat_index), vec3(1e-9), vec3(5e8));
-    mat3 scale_sqr_matrix =
-            mat3(scale.x * scale.x, 0.0, 0.0, 0.0, scale.y * scale.y, 0.0, 0.0,
-                 0.0, scale.z * scale.z);
+    // Only the two tangent-plane scales are used by 2DGS.
+    // scale.z is intentionally ignored.
+    vec2 scale =
+            clamp(LoadLinearScale(splat_index).xy,
+                  vec2(1e-9), vec2(5e8));
+
     mat3 rotation = QuaternionToRotation(LoadRotation(splat_index));
-    // world_from_model is identity so view_from_model == view_from_world.
-    mat3 view_from_model = mat3(view_params.view_from_world) * rotation;
-    mat3 covariance_view =
-            view_from_model * scale_sqr_matrix * transpose(view_from_model);
 
-    vec3 clip_row0 = vec3(view_params.clip_from_view[0].x,
-                          view_params.clip_from_view[1].x,
-                          view_params.clip_from_view[2].x);
-    vec3 clip_row1 = vec3(view_params.clip_from_view[0].y,
-                          view_params.clip_from_view[1].y,
-                          view_params.clip_from_view[2].y);
-    vec3 clip_row3 = vec3(view_params.clip_from_view[0].w,
-                          view_params.clip_from_view[1].w,
-                          view_params.clip_from_view[2].w);
+    // Quaternion local X/Y axes define the surfel tangent directions.
+    vec3 tangent_u_world = rotation[0] * scale.x;
+    vec3 tangent_v_world = rotation[1] * scale.y;
 
-    float inv_w_sq = 1.0 / (clip_center.w * clip_center.w);
+    // Directions use w=0; center uses w=1.
+    vec4 view_u =
+            view_params.view_from_world * vec4(tangent_u_world, 0.0);
+    vec4 view_v =
+            view_params.view_from_world * vec4(tangent_v_world, 0.0);
+
+    vec4 clip_u = view_params.clip_from_view * view_u;
+    vec4 clip_v = view_params.clip_from_view * view_v;
+
     vec2 resolution = GetViewportSize();
-    vec3 jacobian_x = 0.5 * resolution.x *
-                      (clip_row0 * clip_center.w - clip_row3 * clip_center.x) *
-                      inv_w_sq;
-    // Match the projected 2D covariance to the output image's Y convention.
-    // OpenGL images use Y increasing upward; Metal/output textures use Y=0 at
-    // the top. The sign must match the pixel coordinate system consumed later
-    // by the composite shader.
     float y_sign = GetScreenYDown() ? -1.0 : 1.0;
-    vec3 jacobian_y = y_sign * 0.5 * resolution.y *
-                      (clip_row1 * clip_center.w - clip_row3 * clip_center.y) *
-                      inv_w_sq;
 
-    vec3 cov_jx = covariance_view * jacobian_x;
-    vec3 cov_jy = covariance_view * jacobian_y;
-    // Pre-blur 2D covariance values (before the kEps2D subpixel
-    // regularisation).
-    float raw_xx = dot(jacobian_x, cov_jx);
-    float raw_xy = dot(jacobian_x, cov_jy);
-    float raw_yy = dot(jacobian_y, cov_jy);
-    // Add subpixel blur to regularise tiny splats (standard 3DGS
-    // anti-aliasing).
-    float cov_xx = raw_xx + kEps2D;
-    float cov_xy = raw_xy;
-    float cov_yy = raw_yy + kEps2D;
-    // Density compensation (gsplat PR #117): reduce opacity of splats whose
-    // apparent size is dominated by the blur kernel rather than their geometry.
-    //   compensation = sqrt(det(Sigma_orig) / det(Sigma_blurred))
-    // This prevents tiny splats from becoming artificially bright after
-    // blurring.
-    if (GetAntialias()) {
-        float det_orig = raw_xx * raw_yy - raw_xy * raw_xy;
-        float det_blur = cov_xx * cov_yy - cov_xy * cov_xy;
-        alpha *= sqrt(max(0.0, det_orig / det_blur));
-    }
+    // For local homogeneous coordinate q=(u,v,1):
+    //
+    // pixel_x = dot(row_x, q) / dot(row_w, q)
+    // pixel_y = dot(row_y, q) / dot(row_w, q)
+    //
+    // Works for both perspective and orthographic projection.
+    vec3 clip_x = vec3(clip_u.x, clip_v.x, clip_center.x);
+    vec3 clip_y = vec3(clip_u.y, clip_v.y, clip_center.y);
+    vec3 clip_w = vec3(clip_u.w, clip_v.w, clip_center.w);
 
-    float mid = 0.5 * (cov_xx + cov_yy);
-    float radius = length(vec2(0.5 * (cov_xx - cov_yy), cov_xy));
-    float lambda1 = max(mid + radius, kMinEigenValue);
-    float lambda2 = max(mid - radius, kMinEigenValue);
+    vec3 row_x =
+            0.5 * resolution.x * (clip_x + clip_w);
+    vec3 row_y =
+            0.5 * resolution.y * (y_sign * clip_y + clip_w);
+    vec3 row_w = clip_w;
 
-    vec2 major_dir = radius > 1e-6 ? normalize(vec2(cov_xy, lambda1 - cov_xx))
-                                   : vec2(1.0, 0.0);
-    vec2 minor_dir = vec2(major_dir.y, -major_dir.x);
-    vec2 major_axis = sqrt(2.0 * lambda1) * major_dir;
-    vec2 minor_axis = sqrt(2.0 * lambda2) * minor_dir;
-
-    // Tighten the bbox to only cover pixels where this splat's contribution
-    // exceeds kMinAlpha.  At a Gaussian-UV distance r the per-pixel alpha is
-    // exp(-r²) * alpha, so the threshold is reached at:
-    //   r_eff = sqrt(log(alpha / kMinAlpha))
-    // Cap at 2.0 to match the composite pass's own power < -4.0 early-out,
-    // so opaque splats (alpha >= kMinAlpha * e^4 ≈ 0.21) keep the same
-    // footprint as before.  Translucent floaters get a proportionally smaller
-    // bbox, directly reducing their tile-entry count and buffer pressure.
-    float alpha_cutoff_radius =
-            min(sqrt(max(0.0, log(alpha / kMinAlpha))), 2.0);
-    float bbox_half_x =
-            alpha_cutoff_radius * length(vec2(major_axis.x, minor_axis.x));
-    float bbox_half_y =
-            alpha_cutoff_radius * length(vec2(major_axis.y, minor_axis.y));
-    vec2 bbox_half_extent = max(vec2(bbox_half_x, bbox_half_y), vec2(0.5));
-
-    float basis_det = major_axis.x * minor_axis.y - minor_axis.x * major_axis.y;
-    if (abs(basis_det) < kMinDeterminant) {
+    vec2 center_pixel;
+    vec2 surfel_half_extent;
+    if (!ComputeSurfelAabb(row_x, row_y, row_w,
+                           kSurfelCutoff,
+                           center_pixel,
+                           surfel_half_extent)) {
         return CulledEntryParams(splat_index);
     }
 
-    vec2 center_ndc = clip_center.xy / clip_center.w;
-    // Convert NDC to pixel coordinates using the backend's image-space origin.
-    float center_y = center_ndc.y * 0.5 + 0.5;
-    if (GetScreenYDown()) {
-        center_y = 1.0 - center_y;
-    }
-    vec2 center_pixel = vec2((center_ndc.x * 0.5 + 0.5) * resolution.x,
-                             center_y * resolution.y);
+    // 2DGS screen-space low-pass filter:
+    // rho_screen = 2 * |pixel-center|^2
+    // Therefore rho_screen <= cutoff^2 requires
+    // radius >= cutoff / sqrt(2).
+    vec2 bbox_half_extent =
+            max(surfel_half_extent,
+                vec2(kSurfelCutoff * kFilterSize));
+
     vec2 min_pixel = floor(center_pixel - bbox_half_extent);
     vec2 max_pixel = ceil(center_pixel + bbox_half_extent);
 
@@ -434,31 +343,37 @@ SortEntryParams ProjectGaussian(uint splat_index) {
         return CulledEntryParams(splat_index);
     }
 
-    float inv_basis_det = 1.0 / basis_det;
-    vec4 inv_basis =
-            vec4(minor_axis.y * inv_basis_det, -minor_axis.x * inv_basis_det,
-                 -major_axis.y * inv_basis_det, major_axis.x * inv_basis_det);
-
-    vec3 view_dir = world_position - view_params.camera_position_and_near.xyz;
-    float view_dir_length_sq = dot(view_dir, view_dir);
-    if (view_dir_length_sq > 0.0) {
-        view_dir *= inversesqrt(view_dir_length_sq);
-    } else {
-        view_dir = vec3(0.0, 0.0, 1.0);
-    }
+    // Linear view-space depth for q=(u,v,1):
+    // depth(q) = dot(linear_depth_coeff, q)
+    vec3 linear_depth_coeff =
+            -vec3(view_u.z, view_v.z, view_center.z);
 
     // Normalize view-space depth to [0, 1] with near=0, far=1.
     // Uniform distribution gives constant sort-key resolution across the range.
     // Splats outside [near, far] are already culled above, so always in [0, 1].
-    float norm_depth = (-view_center.z - near) / (far - near);
 
-    // Composite buffer (binding 6): all composite-pass data in one 32 B struct.
-    composite[splat_index].center_xy_fp16 = packHalf2x16(center_pixel);
-    composite[splat_index].depth = norm_depth;
-    composite[splat_index].alpha = alpha;
-    composite[splat_index].packed_rgba8 =
-            PackColorRGBA8(EvaluateShColor(splat_index, view_dir, dc));
-    composite[splat_index].inv_basis = inv_basis;
+    float norm_depth = (linear_depth_coeff.z - near) / (far - near);
+
+    uint metadata = splat_index * kSurfaceWords;
+    uint flags = surface_data[metadata + 5u];
+    composite[splat_index].surface_id = surface_data[metadata + 4u];
+    composite[splat_index].surface_flags = flags;
+    vec3 surface_normal = normalize(mat3(view_params.view_from_world) * rotation[2]);
+    composite[splat_index].surface_normal_xy = surface_normal.xy;
+    composite[splat_index].surface_normal_z_sigma =
+            vec2(surface_normal.z, min(scale.x, scale.y));
+    composite[splat_index].surface_color_rg =
+            uintBitsToFloat(uvec2(surface_data[metadata + 6u], surface_data[metadata + 7u]));
+    composite[splat_index].surface_color_b_reserved =
+            vec2(uintBitsToFloat(surface_data[metadata + 8u]), 0.0);
+    composite[splat_index].row_x_xy = row_x.xy;
+    composite[splat_index].row_x_zw = vec2(row_x.z, linear_depth_coeff.x);
+    composite[splat_index].row_y_xy = row_y.xy;
+    composite[splat_index].row_y_zw = vec2(row_y.z, linear_depth_coeff.y);
+    composite[splat_index].row_w_xy = row_w.xy;
+    composite[splat_index].row_w_zw = vec2(row_w.z, linear_depth_coeff.z);
+    composite[splat_index].clip1_angle_split = LoadClipAngleSplit(splat_index, 0u);
+    composite[splat_index].clip2_angle_split = LoadClipAngleSplit(splat_index, 1u);
 
     // Return tile range and packed depth for WriteSortEntries, which issues
     // one batched atomicAdd per subgroup instead of one per (splat, tile).

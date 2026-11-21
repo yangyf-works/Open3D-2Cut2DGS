@@ -274,7 +274,7 @@ public:
     ///   [x, y, z] = [x', y', z'] / w'
     ///
     /// \note For Gaussian splat point clouds (IsGaussianSplat()), the
-    ///   Gaussian-specific attributes (rot, scale, f_dc, f_rest) are
+    ///   Gaussian-specific attributes (rot, scale) are
     ///   **not** updated because the linear part of a general 4x4 matrix
     ///   may be non-orthogonal. A warning is logged. Use Rotate(), Scale(),
     ///   and Translate() to transform splat clouds consistently.
@@ -296,8 +296,7 @@ public:
     /// \note For Gaussian splat point clouds (IsGaussianSplat()), the linear
     ///   scale attributes are multiplied by |scale|. Negative scale means
     ///   point inversion + uniform scaling: positions are mirrored, axis
-    ///   lengths scale by |scale|, and odd-degree SH bands in f_rest are
-    ///   negated. Quaternions, f_dc, and opacity are unchanged.
+    ///   lengths scale by |scale|. Quaternions and surface_color are unchanged.
     ///
     /// \param scale Scale [double] of dimension
     /// \param center Center [Tensor of dim {3}] about which the PointCloud is
@@ -309,12 +308,9 @@ public:
     ///
     /// \note For Gaussian splat point clouds (IsGaussianSplat()), the
     ///   per-splat quaternion orientations (rot) are composed with
-    ///   Quaternion(R) on CPU, and the SH rest coefficients (f_rest) are
-    ///   rotated via the Ivanic–Ruedenberg recursion on all devices. A proper
-    ///   rotation matrix is assumed, consistent with how normals are rotated
-    ///   (n' = R n, no orthogonality check). The linear scale attributes and
-    ///   f_dc are unchanged. A warning is logged if rot cannot be updated
-    ///   (non-CPU).
+    ///   Quaternion(R) on CPU. A proper rotation matrix is assumed, consistent
+    ///   with how normals are rotated (n' = R n, no orthogonality check).
+    ///   Linear scale and surface_color are unchanged.
     ///
     /// \param R Rotation [Tensor of dim {3,3}].
     /// Should be on the same device as the PointCloud
@@ -839,27 +835,45 @@ public:
             MetricParameters params = MetricParameters()) const;
 
     /// Check if this point cloud has all the attributes required for a Gaussian
-    /// Splat. This checks for the presence of scale, rot, opacity and f_dc
-    /// attributes.
+    /// Splat. Shape attributes scale and rot identify a Gaussian; shared
+    /// surface_color must then be present.
     ///
-    /// \note For 3D Gaussian splats, the \c "scale" point attribute is stored
-    /// in
-    /// \b linear space (axis lengths), consistent with rendering. PLY files
-    /// from typical 3DGS tools store scales in log-space; \c
-    /// t::io::ReadPointCloudFromPLY converts them to linear on load. SPLAT
-    /// files store linear scales and are copied as-is. When writing PLY, scales
-    /// are converted back to log-space for compatibility with common PLY
-    /// conventions.
-    /// \returns True if a valid 3DGS point cloud, else False.
-    /// \throws If point cloud has 3DGS attributes, but they are invalid (wrong
-    /// shape).
+    /// \note For planar 2D Gaussian splats, \c "scale" has shape {N,1} in
+    /// \b linear space: one tangent sigma per GS, shared by X and Y. {N,2} and {N,3}
+    /// scales are not supported. \c "rot" has shape {N,4} in (w,x,y,z)
+    /// order. Rendering packs rot and normalized clip pairs to Float16;
+    /// decoded rot is normalized. Small boundary shifts are accepted and
+    /// input Float32 tensors remain unchanged.
+    /// PLY stores scale_0 in log-space and converts on I/O.
+    /// Per-GS opacity is unsupported and raises std::invalid_argument;
+    /// the renderer uses fixed opacity 0.99 for every Gaussian.
+    /// surface_color is required Float32 {N,3} finite unlit RGB in [0,1].
+    /// Lighting is scene-wide through MaterialRecord.gaussian_splat_surface_lighting
+    /// (ambient,diffuse,specular; default 1,0,0). Per-GS surface_lighting is
+    /// rejected without conversion in both regular and opaque rendering.
+    /// Optional surface_id is nonnegative Int32 {N,1}. Removed f_dc/f_rest
+    /// and surface_lighting names are rejected even on incomplete or ordinary clouds.
+    /// \returns True if a valid 2DGS point cloud, else False.
+    /// \throws For missing/invalid Gaussian appearance or invalid shapes,
+    /// including mismatched lengths; malformed GS never fall back silently.
     bool IsGaussianSplat() const;
 
-    /// \brief Returns the order of spherical harmonics used for Gaussian
-    /// Splatting. Returns 0 if f_rest is not present.
-    /// \throws If point cloud has f_rest 3DGS attribute, with the wrong
-    /// shape.
-    int GaussianSplatGetSHOrder() const;
+    /// Validate the four clipping attributes before renderer state changes.
+    /// Also rejects obsolete clipping names on non-Gaussian or empty clouds.
+    /// Throws std::invalid_argument for obsolete names or incomplete groups.
+    void ValidateGaussianSplatClipping() const;
+
+    /// Return a shallow copy with four Float32 {N,1} clipping attributes.
+    /// Angles are normalized to [-pi,pi); 4 denotes an inactive boundary.
+    /// Keeps cos(angle)*u+sin(angle)*v >= split in normalized local coordinates.
+    /// All four attributes are required together; omitting all means ordinary
+    /// 2DGS. Obsolete clipping attributes are rejected without conversion.
+    /// Gaussian scales must have shape {N,1}; {N,2}/{N,3} are rejected.
+    /// Other tensors remain shared. This CPU-only normalization never
+    /// transfers a point cloud between devices.
+    /// Example: auto canonical = cloud.NormalizeGaussianSplatClipping();
+    PointCloud NormalizeGaussianSplatClipping() const;
+
 
 protected:
     core::Device device_ = core::Device("CPU:0");
