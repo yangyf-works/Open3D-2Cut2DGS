@@ -92,5 +92,7 @@ docs/python_example/
 docs/conf.py
 docs/Doxyfile
 docs/getting_started.rst
+docs/dev_wheels.rst
+docs/sycl.rst
 docs/docker.rst
 docs/tensorboard.md
